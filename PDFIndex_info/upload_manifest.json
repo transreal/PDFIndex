@@ -1,0 +1,12 @@
+{
+	"packageName":"PDFIndex",
+	"files":[
+		"PDFIndex.wl"
+	],
+	"directories":[
+		"PDFIndex_info"
+	],
+	"excludePatterns":[
+		"PDFIndex_info\/history\/"
+	]
+}
