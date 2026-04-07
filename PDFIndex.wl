@@ -37,6 +37,12 @@ pdfIndexDirectory::usage =
 pdfIndexURL::usage =
   "pdfIndexURL[url, opts] はURLからPDFをダウンロードしてインデックスする。";
 
+pdfIndexAsync::usage =
+  "pdfIndexAsync[pdfPath, opts] は pdfIndex を実行し、進捗をステータスバーに表示する。\n" <>
+  "Print 出力がノートブックのセル出力に混入しない。\n" <>
+  "内部の Claude 呼び出しは NonBlocking (StartProcess + Pause) で\n" <>
+  "フロントエンドの応答性を維持する。";
+
 pdfReindex::usage =
   "pdfReindex[collection] はコレクション内の全ドキュメントのLLM要約・embedding を再生成する。";
 
@@ -134,6 +140,7 @@ If[!StringQ[PDFIndex`$pdfIndexAttachDir],
 (* インデクシング状態管理 *)
 $pdfIndexTaskStatus = <|"state" -> "idle"|>;
 $pdfIndexAsyncContext = <||>;
+$pdfIndexAsyncJobs = <||>;
 
 (* インデックスキャッシュ *)
 $pdfIndexCache = <||>;
@@ -188,9 +195,18 @@ iIsURL[_] := False;
 (* ============================================================ *)
 
 $pythonPDFExtractCode = "
-import sys, json, os
+import sys, json, os, warnings
+warnings.filterwarnings('ignore')
 
 def extract_pdf(pdf_path, max_pages=None):
+    _old_stderr = sys.stderr
+    sys.stderr = open(os.devnull, 'w')
+    try:
+        return _extract_pdf_impl(pdf_path, max_pages)
+    finally:
+        sys.stderr = _old_stderr
+
+def _extract_pdf_impl(pdf_path, max_pages=None):
     \"\"\"Extract text and metadata from PDF using PyMuPDF (fitz).\"\"\"
     try:
         import fitz  # PyMuPDF
@@ -258,7 +274,7 @@ def extract_pdf_pdfplumber(pdf_path, max_pages=None):
         return {'error': str(e)}
 ";
 
-iPDFExtract[pdfPath_String, maxPages_:None] := Module[
+iPDFExtract[pdfPath_String, maxPages_:None, skipOCR_:False] := Module[
   {escapedPath, maxPagesStr, pyCode, outJsonFile, result, json},
   (* Windows パスのバックスラッシュを安全にエスケープ *)
   escapedPath = StringReplace[pdfPath, "\\" -> "/"];
@@ -286,11 +302,253 @@ iPDFExtract[pdfPath_String, maxPages_:None] := Module[
       If[KeyExistsQ[json, "error"],
         Print["  \[WarningSign] PDF\:62bd\:51fa\:30a8\:30e9\:30fc: " <> json["error"]];
         Return[iPDFExtractWL[pdfPath, maxPages]]];
-      Return[json]]];
+      Return[If[TrueQ[skipOCR], json, iFixGarbledPages[json, pdfPath]]]]];
   (* Python 実行失敗 or JSON なし → WL フォールバック *)
   If[TrueQ[PDFIndex`$pdfIndexDebug],
     Print["  [iPDFExtract] Python\:7d50\:679c: " <> ToString[Short[result]]]];
   iPDFExtractWL[pdfPath, maxPages]
+];
+
+(* === 文字化け検出 ===
+   CIDフォント等で文字化けするページを検出。
+   文字化けテキストの特徴:
+     - 個別の漢字語（科目名等）は偶然読めることがある
+     - しかし助詞・接続の「ひらがな連続」(の、を、にする、について等)がない
+     - 正常テキスト: 「...に関する専門知識の修得」→ 「に」「する」「の」
+     - 文字化け: 「確蕊2繊討...」→ ひらがな連続なし
+   判定: 2文字以上のひらがな連続出現数が少なければ文字化け *)
+iIsGarbledText[text_String] := Module[
+  {len, latinCount, hiraSeqs},
+  len = StringLength[text];
+  If[len < 200, Return[False]];
+  latinCount = StringCount[text, RegularExpression["[a-zA-Z]"]];
+  If[latinCount / N[len] > 0.5, Return[False]];
+  (* 2文字以上のひらがな連続を検出 *)
+  hiraSeqs = StringCount[text,
+    RegularExpression["[\\x{3041}-\\x{309F}]{2,}"]];
+  (* 正常な日本語: 200文字あたり3回以上のひらがな連続がある。
+     表ページ(漢字多め)でも「の」「を」「に」等の助詞ペアが頻出。
+     例: R04 p.3 (3957ch, 読める) → ~30回
+         R05 p.1 (939ch, 文字化け) → 0回
+         R03 p.4 (2546ch, 文字化け) → 0回 *)
+  hiraSeqs < Max[1, len / 500]
+];
+
+(* === 文字化けページの再抽出 ===
+   iPDFExtract の結果を後処理し、文字化けページを Claude Code CLI で修復する。
+   方法: PyMuPDF で画像化 → ファイル保存 → ClaudeQuery (文字列版=CLI,課金なし)
+         で画像ファイルパスを伝え、Claude Code のツール(Bash等)で読取依頼。
+   フォールバック: Mathematica TextRecognize *)
+iFixGarbledPages[extractResult_Association, pdfPath_String] :=
+  Module[{pages, garbledNums = {}},
+    If[!KeyExistsQ[extractResult, "pages"], Return[extractResult]];
+    pages = extractResult["pages"];
+    (* 文字化けページを検出 *)
+    Do[Module[{text = Lookup[p, "text", ""]},
+      If[iIsGarbledText[text],
+        AppendTo[garbledNums, Lookup[p, "pageNum", 0]]]],
+      {p, pages}];
+    If[Length[garbledNums] === 0, Return[extractResult]];
+    If[TrueQ[PDFIndex`$pdfIndexDebug],
+      Print["  \:26a0\:fe0f \:6587\:5b57\:5316\:3051\:691c\:51fa: p." <>
+        StringRiffle[ToString /@ garbledNums, ","] <>
+        " \:2192 EasyOCR\:3067\:518d\:62bd\:51fa"]];
+    (* 各文字化けページを処理 *)
+    (* OCR 修正テキストを保存: 後段の構造化チャンキングで使用 *)
+    $pdfIndexAsyncContext["ocrFixedPages"] = <||>;
+    pages = Map[
+      Module[{pg = Lookup[#, "pageNum", 0], ocrText},
+        If[MemberQ[garbledNums, pg],
+          ocrText = iOCRPageWithClaudeCode[pdfPath, pg];
+          If[StringQ[ocrText] && StringLength[ocrText] > 20,
+            If[TrueQ[PDFIndex`$pdfIndexDebug],
+              Print["  \:2714 p." <> ToString[pg] <> ": " <>
+                ToString[StringLength[ocrText]] <> " chars"]];
+            $pdfIndexAsyncContext["ocrFixedPages"][pg] = ocrText;
+            Append[KeyDrop[#, "text"], "text" -> ocrText],
+            If[TrueQ[PDFIndex`$pdfIndexDebug],
+              Print["  \:26a0\:fe0f p." <> ToString[pg] <> " OCR\:5931\:6557"]];
+            #],
+          #]] &,
+      pages];
+    Join[KeyDrop[extractResult, "pages"], <|"pages" -> pages|>]
+  ];
+
+(* === OCR パイプライン ===
+   優先順: Claude Vision → EasyOCR → TextRecognize
+   Claude Vision: 日本語表の認識精度が最も高い（CLI経由、Pro/Max含む）
+   EasyOCR: ローカル深層学習ベース（無料、精度中程度）
+   TextRecognize: Mathematica 内蔵（最終手段） *)
+
+iOCRPageWithClaudeCode[pdfPath_String, pageNum_Integer] := Module[
+  {text},
+  (* 1. Claude Vision を試行 *)
+  text = iOCRPageWithClaudeVision[pdfPath, pageNum];
+  If[StringQ[text] && StringLength[text] > 20, Return[text]];
+  (* 2. EasyOCR を試行 *)
+  text = iOCRPageWithEasyOCR[pdfPath, pageNum];
+  If[StringQ[text] && StringLength[text] > 20, Return[text]];
+  (* 3. TextRecognize フォールバック *)
+  iOCRPageFallback[pdfPath, pageNum]
+];
+
+(* Claude Vision OCR: PDFページを画像化し、上下分割して Claude に全テキスト抽出を依頼。
+   大きな画像を1枚で送ると CLI がタイムアウトするため、
+   ページを上下に分割して各半分を別々に OCR し結果をマージする。 *)
+iOCRPageWithClaudeVision[pdfPath_String, pageNum_Integer] := Module[
+  {img, imgFile, escapedPath, pyCode, renderResult,
+   dims, halfH, topImg, botImg, topText, botText, prompt},
+  If[TrueQ[PDFIndex`$pdfIndexDebug],
+    Print["  Claude Vision OCR p." <> ToString[pageNum] <> "..."]];
+  (* ClaudeQueryBg が利用可能か確認 *)
+  If[Length[Names["ClaudeCode`ClaudeQueryBg"]] === 0,
+    If[TrueQ[PDFIndex`$pdfIndexDebug],
+      Print["  ClaudeQueryBg unavailable, skipping Vision OCR"]];
+    Return[None]];
+  (* PyMuPDF で 300 DPI レンダリング → PNG 保存 → Import *)
+  imgFile = FileNameJoin[{$TemporaryDirectory,
+    "pdfocr_vision_" <> IntegerString[Round[AbsoluteTime[] * 1000]] <> ".png"}];
+  escapedPath = StringReplace[pdfPath, "\\" -> "/"];
+  pyCode = "
+import fitz
+doc = fitz.open(r'" <> escapedPath <> "')
+pix = doc[" <> ToString[pageNum - 1] <> "].get_pixmap(dpi=450)
+pix.save(r'" <> StringReplace[imgFile, "\\" -> "/"] <> "')
+doc.close()
+'done'
+";
+  renderResult = Quiet @ Check[ExternalEvaluate["Python", pyCode], $Failed];
+  If[!FileExistsQ[imgFile],
+    If[TrueQ[PDFIndex`$pdfIndexDebug],
+      Print["  \:30da\:30fc\:30b8\:30ec\:30f3\:30c0\:30ea\:30f3\:30b0\:5931\:6557"]];
+    Return[None]];
+  img = Quiet @ Check[Import[imgFile, "PNG"], $Failed];
+  Quiet[DeleteFile[imgFile]];
+  If[!ImageQ[img],
+    If[TrueQ[PDFIndex`$pdfIndexDebug],
+      Print["  \:753b\:50cf\:8aad\:307f\:8fbc\:307f\:5931\:6557"]];
+    Return[None]];
+
+  (* ページを上下に分割 *)
+  dims = ImageDimensions[img]; (* {width, height} *)
+  halfH = Round[dims[[2]] / 2];
+  (* ImageTake[img, {y1, y2}] — 上から y1〜y2 行を切り出し *)
+  topImg = ImageTake[img, {1, halfH + 30}];       (* 30px オーバーラップ *)
+  botImg = ImageTake[img, {halfH - 30, dims[[2]]}];
+
+  prompt = "\:3053\:306e\:753b\:50cf\:306f\:5927\:5b66\:306e\:914d\:5f53\:8868\:ff08\:5c65\:4fee\:8868\:ff09\:306ePDF\:30da\:30fc\:30b8\:306e\:4e00\:90e8\:3067\:3059\:3002" <>
+    "\:8868\:306e\:5168\:3066\:306e\:884c\:3092\:7701\:7565\:305b\:305a\:62bd\:51fa\:3057\:3066\:304f\:3060\:3055\:3044\:3002" <>
+    "\:79d1\:76ee\:30b3\:30fc\:30c9\:3068\:79d1\:76ee\:540d\:3092\:6b63\:78ba\:306b\:3002" <>
+    "\:51fa\:529b\:306f\:62bd\:51fa\:30c6\:30ad\:30b9\:30c8\:306e\:307f\:3002\:8aac\:660e\:4e0d\:8981\:3002";
+
+  (* 上半分を OCR — 分割画像は小さいので $iMediaMaxImageSize を一時的に拡大 *)
+  Print["  Claude Vision OCR p." <> ToString[pageNum] <> " \:4e0a\:534a\:5206..."];
+  topText = Quiet @ Check[
+    Block[{ClaudeCode`$iMediaMaxImageSize = 1568},
+      ClaudeCode`ClaudeQueryBg[{prompt, topImg},
+        NonBlocking -> True, Timeout -> 180]],
+    $Failed];
+  If[!StringQ[topText] || StringStartsQ[topText, "Error:"],
+    Print["  Claude Vision \:4e0a\:534a\:5206\:5931\:6557: " <>
+      If[StringQ[topText], StringTake[topText, UpTo[60]], "N/A"]];
+    topText = ""];
+
+  (* 下半分を OCR *)
+  Print["  Claude Vision OCR p." <> ToString[pageNum] <> " \:4e0b\:534a\:5206..."];
+  botText = Quiet @ Check[
+    Block[{ClaudeCode`$iMediaMaxImageSize = 1568},
+      ClaudeCode`ClaudeQueryBg[{prompt, botImg},
+        NonBlocking -> True, Timeout -> 180]],
+    $Failed];
+  If[!StringQ[botText] || StringStartsQ[botText, "Error:"],
+    Print["  Claude Vision \:4e0b\:534a\:5206\:5931\:6557: " <>
+      If[StringQ[botText], StringTake[botText, UpTo[60]], "N/A"]];
+    botText = ""];
+
+  (* 結果をマージ *)
+  If[StringLength[topText] + StringLength[botText] > 20,
+    Print["  \:2714 p." <> ToString[pageNum] <> ": " <>
+      ToString[StringLength[topText]] <> "+" <>
+      ToString[StringLength[botText]] <> " chars (Claude Vision)"];
+    StringTrim[topText] <> "\n" <> StringTrim[botText],
+    Print["  Claude Vision OCR \:5931\:6557 (\:4e21\:534a\:5206\:3068\:3082\:4e0d\:5341\:5206)"];
+    None]
+];
+
+(* EasyOCR: PyMuPDF で 400 DPI レンダリング + 画像前処理 + EasyOCR *)
+iOCRPageWithEasyOCR[pdfPath_String, pageNum_Integer] := Module[
+  {pathFile, ocrOutFile, pyCode, result, text},
+  If[TrueQ[PDFIndex`$pdfIndexDebug],
+    Print["  EasyOCR p." <> ToString[pageNum] <> "..."]];
+  (* PDF パスを一時ファイルに書き出し (日本語パス問題回避) *)
+  pathFile = FileNameJoin[{$TemporaryDirectory,
+    "pdfpath_" <> IntegerString[Round[AbsoluteTime[] * 1000]] <> ".txt"}];
+  ocrOutFile = FileNameJoin[{$TemporaryDirectory,
+    "pdfocr_" <> IntegerString[Round[AbsoluteTime[] * 1000]] <> ".txt"}];
+  Export[pathFile, pdfPath, "Text", CharacterEncoding -> "UTF-8"];
+  (* 400 DPI レンダリング + EasyOCR を1回の Python 呼び出しで実行 *)
+  pyCode = "
+import os, fitz
+
+_result = 'INIT'
+try:
+    import easyocr
+    _reader = easyocr.Reader(['ja', 'en'], gpu=False)
+    # PDF パスを一時ファイルから読み取り
+    with open(r'" <> StringReplace[pathFile, "\\" -> "/"] <>
+      "', 'r', encoding='utf-8') as f:
+        pdf_path = f.read().strip()
+    doc = fitz.open(pdf_path)
+    pix = doc[" <> ToString[pageNum - 1] <> "].get_pixmap(dpi=400)
+    img_path = r'" <> StringReplace[
+      FileNameJoin[{$TemporaryDirectory, "pdfocr_render.png"}], "\\" -> "/"] <> "'
+    pix.save(img_path)
+    doc.close()
+    results = _reader.readtext(img_path, detail=0, paragraph=True)
+    text = '\\n'.join(results)
+    os.remove(img_path)
+    with open(r'" <> StringReplace[ocrOutFile, "\\" -> "/"] <>
+      "', 'w', encoding='utf-8') as f:
+        f.write(text)
+    _result = 'OK:' + str(len(text))
+except Exception as e:
+    _result = 'ERR:' + str(e)
+_result
+";
+  result = Quiet[ExternalEvaluate["Python", pyCode]];
+  Quiet[DeleteFile[pathFile]];
+  If[TrueQ[PDFIndex`$pdfIndexDebug],
+    Print["  EasyOCR result: " <> ToString[result]]];
+  If[StringQ[result] && StringStartsQ[result, "ERR:"],
+    Print["  EasyOCR error: " <> result]];
+  text = If[FileExistsQ[ocrOutFile],
+    Module[{t = Import[ocrOutFile, "Text", CharacterEncoding -> "UTF-8"]},
+      Quiet[DeleteFile[ocrOutFile]]; t],
+    None];
+  If[StringQ[text] && StringLength[text] > 20,
+    If[TrueQ[PDFIndex`$pdfIndexDebug],
+      Print["  \:2714 p." <> ToString[pageNum] <> ": " <>
+        ToString[StringLength[text]] <> " chars (EasyOCR)"]];
+    Return[text]];
+  If[TrueQ[PDFIndex`$pdfIndexDebug],
+    Print["  EasyOCR\:5931\:6557 \:2192 TextRecognize"]];
+  iOCRPageFallback[pdfPath, pageNum]
+];
+
+(* Mathematica TextRecognize フォールバック *)
+iOCRPageFallback[pdfPath_String, pageNum_Integer] := Module[
+  {img, wlText},
+  img = Quiet @ Check[iRenderPagePyMuPDF[pdfPath, pageNum], $Failed];
+  If[img =!= $Failed,
+    wlText = Quiet @ Check[
+      TextRecognize[img, Language -> "Japanese"], $Failed];
+    If[StringQ[wlText] && StringLength[wlText] > 20,
+      If[TrueQ[PDFIndex`$pdfIndexDebug],
+        Print["  \:2714 p." <> ToString[pageNum] <> ": " <>
+          ToString[StringLength[wlText]] <> " chars (TextRecognize)"]];
+      wlText,
+      $Failed],
+    $Failed]
 ];
 
 (* Mathematica ネイティブ PDF Import フォールバック *)
@@ -987,27 +1245,67 @@ iQueryLocalLLM[prompt_String] := Module[{result},
 
 (* ============================================================ *)
 (* Embedding ヘルパー                                            *)
-(* Embedding は低コストなため課金API使用を許可。                   *)
-(* 優先順: maildb → LLMSynthesize → 空ベクトル                   *)
+(* LM Studio (localhost:1234) の OpenAI 互換 API を直接呼び出し。 *)
+(* モデル: text-embedding-multilingual-e5-large-instruct          *)
+(* 課金API不使用。ローカル実行。                                  *)
 (* ============================================================ *)
 
+$embeddingEndpoint = "http://localhost:1234/v1/embeddings";
+$embeddingModel = "text-embedding-multilingual-e5-large-instruct";
+
 iCreateEmbeddings[texts_List] := Module[{result},
-  (* 1. maildb.wl の createEmbeddings を優先使用 *)
+  If[Length[texts] === 0, Return[{}]];
+  (* 1. LM Studio (localhost:1234) を優先使用 *)
+  result = Quiet @ Check[iEmbedViaLMStudio[texts], $Failed];
+  If[ListQ[result] && Length[result] === Length[texts] &&
+     ListQ[First[result]] && Length[First[result]] > 10,
+    Return[result]];
+  (* 2. maildb.wl のフォールバック *)
   If[Length[Names["Maildb`Private`createEmbeddings"]] > 0,
     result = Quiet @ Check[Maildb`Private`createEmbeddings[texts], $Failed];
     If[ListQ[result] && Length[result] === Length[texts],
       Return[result]]];
-  (* 2. LLMSynthesize (課金API) — Embedding は低コストのため許可 *)
-  result = Quiet @ Check[
-    Map[
-      Module[{emb},
-        emb = LLMSynthesize[#, LLMEvaluator -> <|"Task" -> "Embedding"|>];
-        If[ListQ[emb], emb, {}]] &,
-      texts],
-    $Failed];
-  If[ListQ[result] && Length[result] === Length[texts], result,
-    (* 3. 全て失敗 → 空ベクトル *)
-    ConstantArray[{}, Length[texts]]]
+  (* 3. 全て失敗 → 空ベクトル (キーワード検索で代替) *)
+  Print["  \:26a0 Embedding\:672a\:4f7f\:7528: LM Studio (" <> $embeddingEndpoint <>
+    ") \:306b\:63a5\:7d9a\:3067\:304d\:307e\:305b\:3093"];
+  ConstantArray[{}, Length[texts]]
+];
+
+(* LM Studio の OpenAI 互換 embeddings API を URLRead で呼び出し。
+   バッチ処理: 最大20テキストずつ送信 (大量テキストのメモリ対策)。 *)
+iEmbedViaLMStudio[texts_List] := Module[
+  {batchSize = 20, allEmbeddings = {}, batch,
+   body, bodyBytes, req, resp, json, embeddings},
+  If[Length[texts] === 0, Return[{}]];
+  Do[
+    batch = texts[[i ;; Min[i + batchSize - 1, Length[texts]]]];
+    batch = StringTake[#, UpTo[2000]] & /@ batch;
+    (* リクエスト構築 *)
+    body = ExportString[
+      <|"model" -> $embeddingModel, "input" -> batch|>,
+      "RawJSON"];
+    bodyBytes = StringToByteArray[body, "UTF-8"];
+    req = HTTPRequest[$embeddingEndpoint, <|
+      Method -> "POST",
+      "ContentType" -> "application/json",
+      "Body" -> bodyBytes|>];
+    (* API 呼び出し *)
+    resp = Quiet @ Check[URLRead[req, "BodyByteArray"], $Failed];
+    If[!MatchQ[resp, _ByteArray],
+      Return[$Failed, Module]];
+    (* レスポンスパース *)
+    json = Quiet @ Check[
+      Developer`ReadRawJSONString[ByteArrayToString[resp, "UTF-8"]],
+      $Failed];
+    If[!AssociationQ[json] || !KeyExistsQ[json, "data"],
+      Return[$Failed, Module]];
+    (* embedding ベクトルを抽出 (index 順にソート) *)
+    embeddings = SortBy[json["data"], Lookup[#, "index", 0] &];
+    embeddings = Lookup[#, "embedding", {}] & /@ embeddings;
+    allEmbeddings = Join[allEmbeddings, embeddings],
+    {i, 1, Length[texts], batchSize}];
+  If[Length[allEmbeddings] === Length[texts], allEmbeddings,
+    PadRight[allEmbeddings, Length[texts], {{}}]]
 ];
 
 iCreateEmbeddingSession[] :=
@@ -1083,6 +1381,201 @@ iEstimatePrivacy[title_String, sampleText_String] := Module[{prompt, raw, val},
   If[StringQ[val] && StringLength[val] > 0 && StringLength[val] <= 4,
     Clip[ToExpression[val], {0.0, 1.0}],
     0.3]
+];
+
+(* ============================================================ *)
+(* 年度・版メタデータ抽出                                        *)
+(* ============================================================ *)
+
+(* 全角数字→半角数字 *)
+iNormalizeDigits[s_String] := StringReplace[s, {
+  "０" -> "0", "１" -> "1", "２" -> "2", "３" -> "3", "４" -> "4",
+  "５" -> "5", "６" -> "6", "７" -> "7", "８" -> "8", "９" -> "9"}];
+
+(* 和暦→西暦変換 *)
+iJapaneseEraToWestern[era_String, num_Integer] := Which[
+  StringMatchQ[era, ("令和" | "R") ~~ ___], 2018 + num,
+  StringMatchQ[era, ("平成" | "H") ~~ ___], 1988 + num,
+  StringMatchQ[era, ("昭和" | "S") ~~ ___], 1925 + num,
+  True, 0];
+
+(* 西暦→和暦文字列 *)
+iWesternToJapaneseEra[wy_Integer] := Which[
+  wy >= 2019, "令和" <> ToString[wy - 2018],
+  wy >= 1989, "平成" <> ToString[wy - 1988],
+  wy >= 1926, "昭和" <> ToString[wy - 1925],
+  True, ToString[wy]];
+
+(* テキストから年度情報を抽出する。
+   対象パターン: 令和X年度, R5年度, 平成X年度, H30年度, 20XX年度
+   コンテキスト: 入学者, 適用, 版, 年鑑, 要覧, 便覧
+   返り値: <|"rawText" -> "令和4年度入学者に適用",
+            "westernYear" -> 2022,
+            "japaneseYear" -> "令和4",
+            "context" -> "入学者適用"|>  or None *)
+iExtractYearInfo[texts__String] := Module[
+  {allText, matches, best = None, bestYear = 0},
+  allText = iNormalizeDigits[StringJoin[Riffle[{texts}, "\n"]]];
+  (* 令和/平成/昭和 X年度 (正式表記) *)
+  matches = StringCases[allText,
+    RegularExpression["(令和|平成|昭和)(\\d{1,2})年度([入学者に適用版鑑覧便]{0,10})"] :>
+      {"$1", "$2", "$3"}];
+  (* R/H/S 略称 X年度 *)
+  matches = Join[matches, StringCases[allText,
+    RegularExpression["(?<![A-Za-z])(R|H|S)(\\d{1,2})年度([入学者に適用版鑑覧便]{0,10})"] :>
+      {"$1", "$2", "$3"}]];
+  Do[
+    Module[{era = m[[1]], numStr = m[[2]], ctx = m[[3]], wy},
+      wy = iJapaneseEraToWestern[era, ToExpression[numStr]];
+      If[wy > bestYear,
+        bestYear = wy;
+        best = <|"rawText" -> era <> numStr <> "年度" <> ctx,
+                 "westernYear" -> wy,
+                 "japaneseYear" -> iWesternToJapaneseEra[wy],
+                 "context" -> ctx|>]],
+    {m, matches}];
+  (* 西暦 + 年度 *)
+  If[best === None,
+    matches = StringCases[allText,
+      RegularExpression["(20\\d{2})年度"] :> "$1"];
+    If[Length[matches] > 0,
+      bestYear = ToExpression[First[matches]];
+      best = <|"rawText" -> First[matches] <> "年度",
+               "westernYear" -> bestYear,
+               "japaneseYear" -> iWesternToJapaneseEra[bestYear],
+               "context" -> ""|>]];
+  (* フォールバック: ファイル名等から年度なしで抽出
+     "R05", "H30" (単独) or "2023" (単独) *)
+  If[best === None,
+    matches = StringCases[allText,
+      RegularExpression["(?<![A-Za-z])(R|H|S)(0?\\d{1,2})(?![\\d年])"] :>
+        {"$1", "$2"}];
+    Do[Module[{era = m[[1]], numStr = m[[2]], wy},
+      wy = iJapaneseEraToWestern[era, ToExpression[numStr]];
+      If[wy > 2000 && wy > bestYear,
+        bestYear = wy;
+        best = <|"rawText" -> era <> numStr,
+                 "westernYear" -> wy,
+                 "japaneseYear" -> iWesternToJapaneseEra[wy],
+                 "context" -> ""|>]],
+      {m, matches}]];
+  If[best === None,
+    matches = StringCases[allText,
+      RegularExpression["(?<![\\d])(20[12]\\d)(?![\\d年])"] :> "$1"];
+    If[Length[matches] > 0,
+      Module[{wy = ToExpression[First[matches]]},
+        If[wy > bestYear,
+          bestYear = wy;
+          best = <|"rawText" -> ToString[wy],
+                   "westernYear" -> wy,
+                   "japaneseYear" -> iWesternToJapaneseEra[wy],
+                   "context" -> ""|>]]]];
+  best
+];
+
+(* クエリから年度情報を抽出 *)
+iExtractYearFromQuery[query_String] := Module[
+  {q, matches, era, num, wy},
+  q = iNormalizeDigits[query];
+  (* 令和/平成/昭和 X年度 (正式表記) *)
+  matches = StringCases[q,
+    RegularExpression["(令和|平成|昭和)(\\d{1,2})年度?"] :>
+      {"$1", "$2"}];
+  If[Length[matches] > 0,
+    {era, num} = First[matches];
+    wy = iJapaneseEraToWestern[era, ToExpression[num]];
+    Return[wy]];
+  (* R/H/S 略称 *)
+  matches = StringCases[q,
+    RegularExpression["(?<![A-Za-z])(R|H|S)(\\d{1,2})年度?"] :>
+      {"$1", "$2"}];
+  If[Length[matches] > 0,
+    {era, num} = First[matches];
+    wy = iJapaneseEraToWestern[era, ToExpression[num]];
+    Return[wy]];
+  (* 西暦 *)
+  matches = StringCases[q, RegularExpression["(20\\d{2})年度?"] :> "$1"];
+  If[Length[matches] > 0, Return[ToExpression[First[matches]]]];
+  None
+];
+
+(* コレクション内の全ドキュメントの年度情報を取得 *)
+iGetCollectionYearInfo[collection_String] := Module[{docs},
+  docs = iLoadCollectionDocs[collection];
+  If[Length[docs] === 0, Return[None]];
+  (* 最新の年度情報を返す (後方互換) *)
+  Module[{best = None, bestYear = 0},
+    Do[Module[{yi = Lookup[d, "yearInfo", None]},
+      If[AssociationQ[yi] && Lookup[yi, "westernYear", 0] > bestYear,
+        bestYear = yi["westernYear"]; best = yi]],
+      {d, docs}];
+    best]
+];
+
+(* コレクション内の全ドキュメントから年度でベストドキュメントを選択
+   queryYear: 西暦年(Integer) or None (Noneなら最新)
+   返り値: <|"doc" -> docAssoc, "yearNote" -> String|None|> or None *)
+iFindBestDocByYear[collection_String, queryYear_] := Module[
+  {docs, bestDoc = None, bestYear = 0, exactMatch = False, yearNote = None},
+  docs = iLoadCollectionDocs[collection];
+  If[Length[docs] === 0, Return[None]];
+  (* 全ドキュメントをスキャン *)
+  Do[
+    Module[{yi = Lookup[d, "yearInfo", None], wy},
+      If[AssociationQ[yi],
+        wy = Lookup[yi, "westernYear", 0];
+        If[IntegerQ[queryYear],
+          (* 完全一致 *)
+          If[wy === queryYear,
+            bestDoc = d; bestYear = wy; exactMatch = True],
+          (* 最新 *)
+          If[wy > bestYear, bestDoc = d; bestYear = wy]],
+        (* yearInfo なし → queryYear も None のとき候補に *)
+        If[!IntegerQ[queryYear] && bestDoc === None,
+          bestDoc = d]]],
+    {d, docs}];
+  (* 完全一致がなければ最も近いものを探す *)
+  If[IntegerQ[queryYear] && !exactMatch,
+    bestDoc = None; bestYear = 0;
+    Do[Module[{yi = Lookup[d, "yearInfo", None], wy},
+      If[AssociationQ[yi],
+        wy = Lookup[yi, "westernYear", 0];
+        If[wy <= queryYear && wy > bestYear,
+          bestDoc = d; bestYear = wy]]],
+      {d, docs}];
+    (* それでもなければ最新 *)
+    If[bestDoc === None,
+      Do[Module[{yi = Lookup[d, "yearInfo", None], wy},
+        If[AssociationQ[yi],
+          wy = Lookup[yi, "westernYear", 0];
+          If[wy > bestYear, bestDoc = d; bestYear = wy]]],
+        {d, docs}]];
+    If[bestDoc =!= None,
+      yearNote = "\:26a0\:fe0f " <> iWesternToJapaneseEra[queryYear] <>
+        "\:5e74\:5ea6(" <> ToString[queryYear] <>
+        ")\:306e\:8cc7\:6599\:306f\:3042\:308a\:307e\:305b\:3093\:3002" <>
+        iWesternToJapaneseEra[bestYear] <> "\:5e74\:5ea6(" <>
+        ToString[bestYear] <> ")\:7248\:3092\:8868\:793a\:3057\:3066\:3044\:307e\:3059\:3002"]];
+  If[bestDoc === None, bestDoc = First[docs]];
+  <|"doc" -> bestDoc, "yearNote" -> yearNote,
+    "yearMatch" -> If[exactMatch, "exact",
+      If[IntegerQ[queryYear], "approximate", "latest"]]|>
+];
+
+(* 後方互換: コレクションから最初のドキュメントパスを取得 *)
+iFindBestCollectionByYear[queryYear_] := Module[
+  {collections, bestC = None, bestYear = 0},
+  collections = PDFIndex`pdfListCollections[];
+  Do[Module[{yi = iGetCollectionYearInfo[c], wy},
+    If[AssociationQ[yi],
+      wy = Lookup[yi, "westernYear", 0];
+      If[IntegerQ[queryYear],
+        If[wy === queryYear, Return[c, Module]];
+        If[wy <= queryYear && wy > bestYear,
+          bestYear = wy; bestC = c],
+        If[wy > bestYear, bestYear = wy; bestC = c]]]],
+    {c, collections}];
+  bestC
 ];
 
 (* ============================================================ *)
@@ -1226,6 +1719,22 @@ PDFIndex`pdfIndex[pdfPath_String, opts:OptionsPattern[]] :=
       chunks = iChunkFromStructured[pageResults, mergedTables];
       Print["  \:69cb\:9020\:5316\:30c1\:30e3\:30f3\:30af: " <> ToString[Length[chunks]] <> "\:4ef6"];
 
+      (* ステップ6b: OCR 修正テキストでチャンクを置換
+         iFixGarbledPages で Tesseract/TextRecognize が成功したページの
+         テキストで、構造化解析が再抽出した文字化けテキストを上書きする *)
+      Module[{ocrFixed = Lookup[$pdfIndexAsyncContext, "ocrFixedPages", <||>]},
+        If[AssociationQ[ocrFixed] && Length[ocrFixed] > 0,
+          Print["  OCR\:30c6\:30ad\:30b9\:30c8\:3067\:30c1\:30e3\:30f3\:30af\:7f6e\:63db: p." <>
+            StringRiffle[ToString /@ Keys[ocrFixed], ","]];
+          chunks = Map[
+            Module[{pg = Lookup[#, "pageNum", 0], fixedText},
+              fixedText = Lookup[ocrFixed, pg, None];
+              If[StringQ[fixedText],
+                Append[KeyDrop[#, "text"], "text" -> fixedText],
+                #]] &,
+            chunks];
+          $pdfIndexAsyncContext = KeyDrop[$pdfIndexAsyncContext, "ocrFixedPages"]]];
+
       (* カタログを保存用に記録 *)
       $pdfIndexAsyncContext["pendingCatalog"] = catalog];
 
@@ -1272,7 +1781,20 @@ PDFIndex`pdfIndex[pdfPath_String, opts:OptionsPattern[]] :=
       iCollectionDir[collection, "public"]];
 
     (* ドキュメントメタデータ保存 *)
-    Module[{docMeta},
+    Module[{docMeta, yearInfo, firstPageText = ""},
+      (* 年度情報抽出: タイトル、最初の数ページのテキストから *)
+      If[ListQ[Lookup[extractResult, "pages", {}]] &&
+         Length[extractResult["pages"]] > 0,
+        firstPageText = StringJoin[
+          Riffle[
+            Lookup[#, "text", ""] & /@
+              Take[extractResult["pages"], UpTo[5]], "\n"]]];
+      yearInfo = iExtractYearInfo[title, firstPageText];
+      If[AssociationQ[yearInfo],
+        Print["  \:5e74\:5ea6\:60c5\:5831: " <> yearInfo["japaneseYear"] <>
+          "\:5e74\:5ea6 (\:897f\:66a6" <> ToString[yearInfo["westernYear"]] <> ")" <>
+          If[StringLength[Lookup[yearInfo, "context", ""]] > 0,
+            " [" <> yearInfo["context"] <> "]", ""]]];
       docMeta = <|
         "docId" -> docId,
         "title" -> title,
@@ -1284,6 +1806,7 @@ PDFIndex`pdfIndex[pdfPath_String, opts:OptionsPattern[]] :=
         "pageCount" -> Lookup[metadata, "pageCount", 0],
         "chunkCount" -> Length[processedChunks],
         "keywords" -> keywords,
+        "yearInfo" -> yearInfo,
         "indexedAt" -> DateString[Now, "ISODateTime"],
         "storageType" -> If[docPrivacy > 0.5, "private", "public"]
       |>;
@@ -1323,6 +1846,517 @@ PDFIndex`pdfIndex[pdfPath_String, opts:OptionsPattern[]] :=
   ];
 
 PDFIndex`pdfIndex::notfound = "\:30d5\:30a1\:30a4\:30eb\:304c\:898b\:3064\:304b\:308a\:307e\:305b\:3093: `1`";
+
+(* ============================================================ *)
+(* 非同期 pdfIndex v2 — LLMGraph ベース                           *)
+(*                                                              *)
+(* 設計:                                                         *)
+(*   Phase 0 (同期, ~10-20s): Extract + ページ分類 + ビジョン解析 *)
+(*     + チャンキング → LLMGraph 構築                             *)
+(*   Phase 1 (非同期, LLMGraph スケジューラ):                     *)
+(*     文字化けOCR (render → CLI×2) → rechunk → 要約 (CLI×N)    *)
+(*     → finalize (Embedding + 保存)                             *)
+(*                                                              *)
+(* スケジューラはカテゴリ別並列度制御。フロントエンドはブロックしない。 *)
+(* 将来: カテゴリ別並列度制御を導入予定。                         *)
+(* ============================================================ *)
+
+(* ── PDFIndex タスクディスクリプタ ──
+   ノードカテゴリから LLMGraph 抽象カテゴリへのマッピング。
+   並列度は claudecode.wl の $LLMGraphMaxConcurrency がデフォルト。 *)
+$iPdfTaskDescriptor = <|
+  "name" -> "pdfIndex LLMGraph",
+  "categoryMap" -> <|
+    "render"    -> "process",
+    "ocr"       -> "cli-vision",
+    "summarize" -> "cli",
+    "chunk"     -> "sync",
+    "save"      -> "sync"
+  |>
+|>;
+
+(* ── ステータス照会 (LLMGraphDAGStatus 委譲) ── *)
+PDFIndex`pdfIndexAsyncStatus[jobId_String] :=
+  ClaudeCode`LLMGraphDAGStatus[jobId];
+
+(* ── キャンセル (LLMGraphDAGCancel 委譲) ── *)
+PDFIndex`pdfIndexAsyncCancel[jobId_String] :=
+  ClaudeCode`LLMGraphDAGCancel[jobId];
+
+Options[PDFIndex`pdfIndexAsync] = Options[PDFIndex`pdfIndex];
+
+PDFIndex`pdfIndexAsync[pdfPath_String, opts:OptionsPattern[]] :=
+  Module[{nb, jobId, privacy, title, collection, forceReindex,
+          absPath, docId, extractResult, metadata,
+          garbledPages = {}, visionPages = {}, textPages = {},
+          pageResults = {}, chunks, docPrivacy, tocData,
+          mergedTables, catalog, pythonExe,
+          nodes = <||>, prevDep = None,
+          allOcrIds = {}, allSumIds = {}},
+
+    nb = Quiet @ Check[EvaluationNotebook[], $Failed];
+    jobId = "pdfidx-" <> ToString[UnixTime[]] <>
+      "-" <> ToString[RandomInteger[99999]];
+
+    (* ═══════════════════════════════════════════════════
+       Phase 0: 同期処理 (高速、~10-20s)
+       ═══════════════════════════════════════════════════ *)
+
+    privacy    = OptionValue[PDFIndex`pdfIndexAsync, {opts}, Privacy];
+    title      = OptionValue[PDFIndex`pdfIndexAsync, {opts}, Title];
+    collection = OptionValue[PDFIndex`pdfIndexAsync, {opts}, Collection];
+    forceReindex = OptionValue[PDFIndex`pdfIndexAsync, {opts}, ForceReindex];
+
+    (* パス解決 *)
+    absPath = If[iIsURL[pdfPath], iDownloadAndCache[pdfPath],
+      If[FileExistsQ[pdfPath], pdfPath,
+        FileNameJoin[{Quiet @ Check[NotebookDirectory[],
+          Global`$packageDirectory], pdfPath}]]];
+    If[!StringQ[absPath] || !FileExistsQ[absPath], Return[$Failed]];
+
+    docId = iDocId[absPath];
+    If[nb =!= $Failed,
+      Quiet[CurrentValue[nb, WindowStatusArea] = "pdfIndex: \:521d\:671f\:5316..."]];
+
+    (* 既存チェック *)
+    If[!TrueQ[forceReindex],
+      Module[{existing = iFindExistingDoc[docId, collection]},
+        If[AssociationQ[existing],
+          If[nb =!= $Failed, Quiet[CurrentValue[nb, WindowStatusArea] = ""]];
+          Return[existing]]]];
+
+    (* PDF テキスト抽出 (ExternalEvaluate, ~3s)
+       skipOCR=True: 文字化け修復は LLMGraph で非同期実行するため
+       Phase 0 では同期 OCR をスキップ → フロントエンド非ブロック *)
+    If[nb =!= $Failed,
+      Quiet[CurrentValue[nb, WindowStatusArea] = "pdfIndex: \:30c6\:30ad\:30b9\:30c8\:62bd\:51fa\:4e2d..."]];
+    extractResult = iPDFExtract[absPath, None, True];
+    If[!AssociationQ[extractResult], Return[$Failed]];
+
+    metadata = extractResult["metadata"];
+    If[title === None, title = metadata["title"]];
+    If[!StringQ[title] || title === "", title = FileBaseName[absPath]];
+
+    (* TOC 抽出 *)
+    tocData = iExtractTOC[absPath];
+    $pdfIndexAsyncContext["pendingTOC"] = tocData;
+
+    (* 文字化けページ検出: LLMGraph で非同期 OCR する対象を決定 *)
+    If[nb =!= $Failed,
+      Quiet[CurrentValue[nb, WindowStatusArea] = "pdfIndex: \:30da\:30fc\:30b8\:5206\:6790\:4e2d..."]];
+    Module[{pages = Lookup[extractResult, "pages", {}]},
+      Do[If[iIsGarbledText[Lookup[p, "text", ""]],
+        AppendTo[garbledPages, Lookup[p, "pageNum", 0]]],
+        {p, pages}]];
+
+    (* ページ分類 + ビジョン解析 (pure Python、各ページ ~1s) *)
+    Module[{pages = Lookup[extractResult, "pages", {}]},
+      Do[Module[{pg = page["pageNum"], rawText = Lookup[page, "text", ""]},
+        If[iIsTableOrFigurePage[rawText],
+          AppendTo[visionPages, pg];
+          Module[{vr = Quiet @ Check[
+              iAnalyzePageWithVision[absPath, pg], $Failed]},
+            AppendTo[pageResults,
+              If[AssociationQ[vr],
+                Join[vr, <|"pageNum" -> pg, "isVision" -> True|>],
+                <|"pageNum" -> pg, "isVision" -> False,
+                  "rawText" -> rawText,
+                  "paragraphs" -> {}, "tables" -> {}, "figures" -> {}|>]]],
+          AppendTo[textPages, pg];
+          AppendTo[pageResults,
+            <|"pageNum" -> pg, "isVision" -> False,
+              "rawText" -> rawText,
+              "paragraphs" -> {}, "tables" -> {}, "figures" -> {}|>]]],
+        {page, pages}];
+      pageResults = SortBy[pageResults, Lookup[#, "pageNum", 9999] &]];
+
+    (* 表マージ + カタログ + チャンキング *)
+    mergedTables = iMergeSpanningTables[pageResults];
+    catalog = iBuildCatalog[pageResults, mergedTables, tocData];
+    $pdfIndexAsyncContext["pendingCatalog"] = catalog;
+    chunks = iChunkFromStructured[pageResults, mergedTables];
+
+    (* プライバシー推定 *)
+    If[privacy === Automatic,
+      docPrivacy = iEstimatePrivacy[title,
+        If[Length[chunks] > 0, Lookup[chunks[[1]], "text", ""], ""]],
+      docPrivacy = N[privacy]];
+
+    (* Python 実行パスを取得 (Phase 0 の同期コンテキストで安全) *)
+    pythonExe = Quiet @ Check[
+      ExternalEvaluate["Python", "import sys; sys.executable"], "python"];
+
+    (* ═══════════════════════════════════════════════════
+       LLMGraph 構築
+       ═══════════════════════════════════════════════════ *)
+
+    (* ── OCR ノード群: 文字化けページごとに render → ocr-top → ocr-bot ── *)
+    Do[
+      With[{pg = garbledPages[[gi]], prevD = prevDep,
+            ap = absPath, pyExe = pythonExe, jid = jobId},
+        Module[{renderId, ocrTopId, ocrBotId,
+                imgDir, topPath, botPath, outMarker},
+          renderId = "render-" <> ToString[pg];
+          ocrTopId = "ocr-" <> ToString[pg] <> "-top";
+          ocrBotId = "ocr-" <> ToString[pg] <> "-bot";
+          imgDir  = FileNameJoin[{$TemporaryDirectory,
+            "pdfocr_" <> jid <> "_p" <> ToString[pg]}];
+          topPath   = FileNameJoin[{imgDir, "top.png"}];
+          botPath   = FileNameJoin[{imgDir, "bot.png"}];
+          outMarker = FileNameJoin[{imgDir, "render_done.txt"}];
+
+          (* render ノード: Python で PDF → 450 DPI PNG → 上下分割 *)
+          nodes[renderId] = ClaudeCode`iLLMGraphNode[renderId, "python", "render",
+            If[prevD =!= None, {prevD}, {}],
+            With[{ep = StringReplace[ap, "\\" -> "/"],
+                  tp = StringReplace[topPath, "\\" -> "/"],
+                  bp = StringReplace[botPath, "\\" -> "/"],
+                  om = StringReplace[outMarker, "\\" -> "/"],
+                  id = imgDir, px = pyExe, pn = pg},
+              Function[{jobCtx},
+                Module[{pyScript, pyFile, batFile, proc},
+                  If[!DirectoryQ[id],
+                    CreateDirectory[id, CreateIntermediateDirectories -> True]];
+                  pyScript = StringJoin[
+                    "import fitz, io\n",
+                    "from PIL import Image\n",
+                    "doc = fitz.open(r'", ep, "')\n",
+                    "pix = doc[", ToString[pn - 1], "].get_pixmap(dpi=450)\n",
+                    "doc.close()\n",
+                    "img = Image.open(io.BytesIO(pix.tobytes('png')))\n",
+                    "w, h = img.size\n",
+                    "half = h // 2\n",
+                    "img.crop((0, 0, w, half + 30)).save(r'", tp, "')\n",
+                    "img.crop((0, half - 30, w, h)).save(r'", bp, "')\n",
+                    "with open(r'", om, "', 'w') as f:\n",
+                    "    f.write('OK')\n"];
+                  pyFile = FileNameJoin[{id, "render.py"}];
+                  Export[pyFile, pyScript, "Text", CharacterEncoding -> "UTF-8"];
+                  batFile = FileNameJoin[{id, "render.bat"}];
+                  Export[batFile,
+                    "@echo off\r\nchcp 65001 > nul\r\n\"" <> px <>
+                    "\" \"" <> pyFile <> "\" > \"" <> om <> "\" 2>&1\r\n",
+                    "Text", CharacterEncoding -> "ASCII"];
+                  proc = Quiet @ StartProcess[{"cmd", "/c", batFile}];
+                  If[Head[proc] === ProcessObject,
+                    <|"proc" -> proc, "outFile" -> om,
+                      "batFile" -> batFile, "promptFile" -> pyFile,
+                      "startTime" -> AbsoluteTime[]|>,
+                    $Failed]]]]];
+
+          (* OCR 上半分ノード *)
+          nodes[ocrTopId] = ClaudeCode`iLLMGraphNode[ocrTopId, "claude-cli", "ocr", {renderId},
+            With[{tp = topPath, id = imgDir, pn = pg},
+              Function[{jobCtx},
+                Module[{prompt, ts, outFile, promptFile, batFile, proc},
+                  prompt = StringJoin[
+                    "The following files are attached. ",
+                    "Images are included as multimodal content.\n",
+                    "1. ", tp, "\n\n",
+                    "\:3053\:306e\:753b\:50cf\:306f\:5927\:5b66\:306e\:914d\:5f53\:8868\:ff08\:5c65\:4fee\:8868\:ff09\:306ePDF\:30da\:30fc\:30b8\:306e\:4e0a\:534a\:5206\:3067\:3059\:3002",
+                    "\:8868\:306e\:5168\:3066\:306e\:884c\:3092\:7701\:7565\:305b\:305a\:62bd\:51fa\:3057\:3066\:304f\:3060\:3055\:3044\:3002",
+                    "\:79d1\:76ee\:30b3\:30fc\:30c9\:3068\:79d1\:76ee\:540d\:3092\:6b63\:78ba\:306b\:3002",
+                    "\:51fa\:529b\:306f\:62bd\:51fa\:30c6\:30ad\:30b9\:30c8\:306e\:307f\:3002\:8aac\:660e\:4e0d\:8981\:3002"];
+                  ts = ToString[UnixTime[]] <> "ot" <> ToString[pn];
+                  outFile = FileNameJoin[{$TemporaryDirectory,
+                    "pis_ocr_" <> ts <> ".txt"}];
+                  promptFile = FileNameJoin[{$TemporaryDirectory,
+                    "pis_pmt_" <> ts <> ".txt"}];
+                  Block[{strm},
+                    strm = OpenWrite[promptFile, BinaryFormat -> True];
+                    BinaryWrite[strm, ToCharacterCode[prompt, "UTF-8"], "Byte"];
+                    Close[strm]];
+                  batFile = ClaudeCode`iMakeBat[promptFile, outFile, {id}];
+                  proc = Quiet @ StartProcess[{"cmd", "/c", batFile}];
+                  If[Head[proc] === ProcessObject,
+                    <|"proc" -> proc, "outFile" -> outFile,
+                      "promptFile" -> promptFile, "batFile" -> batFile,
+                      "startTime" -> AbsoluteTime[]|>,
+                    $Failed]]]]];
+
+          (* OCR 下半分ノード *)
+          nodes[ocrBotId] = ClaudeCode`iLLMGraphNode[ocrBotId, "claude-cli", "ocr", {ocrTopId},
+            With[{bp = botPath, id = imgDir, pn = pg},
+              Function[{jobCtx},
+                Module[{prompt, ts, outFile, promptFile, batFile, proc},
+                  prompt = StringJoin[
+                    "The following files are attached. ",
+                    "Images are included as multimodal content.\n",
+                    "1. ", bp, "\n\n",
+                    "\:3053\:306e\:753b\:50cf\:306f\:5927\:5b66\:306e\:914d\:5f53\:8868\:ff08\:5c65\:4fee\:8868\:ff09\:306ePDF\:30da\:30fc\:30b8\:306e\:4e0b\:534a\:5206\:3067\:3059\:3002",
+                    "\:8868\:306e\:5168\:3066\:306e\:884c\:3092\:7701\:7565\:305b\:305a\:62bd\:51fa\:3057\:3066\:304f\:3060\:3055\:3044\:3002",
+                    "\:79d1\:76ee\:30b3\:30fc\:30c9\:3068\:79d1\:76ee\:540d\:3092\:6b63\:78ba\:306b\:3002",
+                    "\:51fa\:529b\:306f\:62bd\:51fa\:30c6\:30ad\:30b9\:30c8\:306e\:307f\:3002\:8aac\:660e\:4e0d\:8981\:3002"];
+                  ts = ToString[UnixTime[]] <> "ob" <> ToString[pn];
+                  outFile = FileNameJoin[{$TemporaryDirectory,
+                    "pis_ocr_" <> ts <> ".txt"}];
+                  promptFile = FileNameJoin[{$TemporaryDirectory,
+                    "pis_pmt_" <> ts <> ".txt"}];
+                  Block[{strm},
+                    strm = OpenWrite[promptFile, BinaryFormat -> True];
+                    BinaryWrite[strm, ToCharacterCode[prompt, "UTF-8"], "Byte"];
+                    Close[strm]];
+                  batFile = ClaudeCode`iMakeBat[promptFile, outFile, {id}];
+                  proc = Quiet @ StartProcess[{"cmd", "/c", batFile}];
+                  If[Head[proc] === ProcessObject,
+                    <|"proc" -> proc, "outFile" -> outFile,
+                      "promptFile" -> promptFile, "batFile" -> batFile,
+                      "startTime" -> AbsoluteTime[]|>,
+                    $Failed]]]]];
+
+          AppendTo[allOcrIds, ocrBotId];
+          prevDep = ocrBotId]],
+    {gi, Length[garbledPages]}];
+
+    (* ── rechunk ノード: OCR 結果でチャンクテキストを更新 ── *)
+    nodes["rechunk"] = ClaudeCode`iLLMGraphNode["rechunk", "sync", "chunk", allOcrIds,
+      With[{gPages = garbledPages},
+        Function[{jobCtx},
+          Module[{ns = jobCtx["nodes"], updChunks = Lookup[Lookup[jobCtx, "context", <||>], "chunks", {}]},
+            Do[Module[{pg = gPages[[gi]],
+                       topId, botId, topText, botText, merged},
+              topId = "ocr-" <> ToString[pg] <> "-top";
+              botId = "ocr-" <> ToString[pg] <> "-bot";
+              topText = Lookup[Lookup[ns, topId, <||>], "result", ""];
+              botText = Lookup[Lookup[ns, botId, <||>], "result", ""];
+              If[StringQ[topText],
+                topText = ClaudeCode`cleanOutput[ClaudeCode`stripANSI[topText]]];
+              If[StringQ[botText],
+                botText = ClaudeCode`cleanOutput[ClaudeCode`stripANSI[botText]]];
+              merged = StringTrim[If[StringQ[topText], topText, ""]] <> "\n" <>
+                       StringTrim[If[StringQ[botText], botText, ""]];
+              If[StringLength[merged] > 20,
+                updChunks = Map[
+                  If[Lookup[#, "pageNum", 0] === pg,
+                    Append[KeyDrop[#, "text"], "text" -> merged], #] &,
+                  updChunks]]],
+            {gi, Length[gPages]}];
+            updChunks]]]];
+
+    (* ── summarize ノード群: 各チャンクの LLM 要約 ── *)
+    Do[
+      With[{ci2 = ci, docTitle = title},
+        Module[{sumId = "sum-" <> ToString[ci2]},
+          nodes[sumId] = ClaudeCode`iLLMGraphNode[sumId, "claude-cli", "summarize", {"rechunk"},
+            Function[{jobCtx},
+              Module[{updChunks, chk, prompt, ts, outFile, promptFile, batFile, proc},
+                updChunks = Lookup[
+                  Lookup[jobCtx["nodes"], "rechunk", <||>],
+                  "result", Lookup[Lookup[jobCtx, "context", <||>], "chunks", {}]];
+                chk = If[ci2 <= Length[updChunks], updChunks[[ci2]], <||>];
+                prompt = $pdfChunkSummarizePrompt <>
+                  If[docTitle =!= "", "Document: " <> docTitle <> "\n\n", ""] <>
+                  StringTake[Lookup[chk, "text", ""], UpTo[3000]];
+                ts = ToString[UnixTime[]] <> "s" <> ToString[ci2];
+                outFile = FileNameJoin[{$TemporaryDirectory,
+                  "pis_sum_" <> ts <> ".txt"}];
+                promptFile = FileNameJoin[{$TemporaryDirectory,
+                  "pis_pmt_" <> ts <> ".txt"}];
+                Block[{strm},
+                  strm = OpenWrite[promptFile, BinaryFormat -> True];
+                  BinaryWrite[strm, ToCharacterCode[prompt, "UTF-8"], "Byte"];
+                  Close[strm]];
+                batFile = ClaudeCode`iMakeBat[promptFile, outFile, {}];
+                proc = Quiet @ StartProcess[{"cmd", "/c", batFile}];
+                If[Head[proc] === ProcessObject,
+                  <|"proc" -> proc, "outFile" -> outFile,
+                    "promptFile" -> promptFile, "batFile" -> batFile,
+                    "startTime" -> AbsoluteTime[]|>,
+                  $Failed]]]];
+          AppendTo[allSumIds, sumId]]],
+    {ci, Length[chunks]}];
+
+    (* ── finalize ノード: Embedding 生成 + 保存 ── *)
+    nodes["finalize"] = ClaudeCode`iLLMGraphNode["finalize", "sync", "save", allSumIds,
+      With[{fDocId = docId, fTitle = title, fDocPrivacy = docPrivacy,
+            fCollection = collection, fAbsPath = absPath,
+            fMetadata = metadata, fExtractResult = extractResult,
+            fPdfPath = pdfPath},
+        Function[{jobCtx},
+          Module[{ns = jobCtx["nodes"], finalChunks, processedChunks,
+                  embTexts, embeddings, indexDir, docMeta, yearInfo,
+                  firstPageText = "", docFile, chunkFile},
+            (* rechunk 結果を取得 *)
+            finalChunks = Lookup[
+              Lookup[ns, "rechunk", <||>], "result", Lookup[Lookup[jobCtx, "context", <||>], "chunks", {}]];
+            If[!ListQ[finalChunks], finalChunks = Lookup[Lookup[jobCtx, "context", <||>], "chunks", {}]];
+            (* 各チャンクに LLM 要約結果をマージ *)
+            processedChunks = Table[
+              Module[{sumId = "sum-" <> ToString[k], raw, lines,
+                      summary = "", entities = "", tags = ""},
+                raw = Lookup[Lookup[ns, sumId, <||>], "result", ""];
+                If[StringQ[raw],
+                  lines = StringSplit[raw, "\n"];
+                  Scan[Module[{tr = StringTrim[#]},
+                    Which[
+                      StringStartsQ[tr, "SUMMARY:", IgnoreCase -> True],
+                        summary = StringTrim[StringDrop[tr, 8]],
+                      StringStartsQ[tr, "ENTITIES:", IgnoreCase -> True],
+                        entities = StringTrim[StringDrop[tr, 9]],
+                      StringStartsQ[tr, "TAGS:", IgnoreCase -> True],
+                        tags = StringTrim[StringDrop[tr, 5]]]] &, lines]];
+                Join[If[k <= Length[finalChunks], finalChunks[[k]], <||>],
+                  <|"summary" -> summary, "entities" -> entities,
+                    "tags" -> tags|>]],
+              {k, Length[finalChunks]}];
+            (* Embedding 生成 *)
+            iCreateEmbeddingSession[];
+            embTexts = (iDoubleEscape[
+              Lookup[#, "summary", ""] <> " " <> Lookup[#, "entities", ""] <>
+              " " <> Lookup[#, "tags", ""] <>
+              " " <> StringTake[Lookup[#, "text", ""], UpTo[500]]] &) /@
+              processedChunks;
+            embeddings = Quiet @ Check[iCreateEmbeddings[embTexts], {}];
+            If[ListQ[embeddings] && Length[embeddings] === Length[processedChunks],
+              processedChunks = MapThread[
+                Append[#1, "embedding" ->
+                  If[ListQ[#2] && Length[#2] > 100, #2, {}]] &,
+                {processedChunks, embeddings}],
+              processedChunks = Append[#, "embedding" -> {}] & /@
+                processedChunks];
+            (* 保存 *)
+            indexDir = If[fDocPrivacy > 0.5,
+              iCollectionDir[fCollection, "private"],
+              iCollectionDir[fCollection, "public"]];
+            If[ListQ[Lookup[fExtractResult, "pages", {}]] &&
+               Length[fExtractResult["pages"]] > 0,
+              firstPageText = StringJoin[Riffle[
+                Lookup[#, "text", ""] & /@
+                  Take[fExtractResult["pages"], UpTo[5]], "\n"]]];
+            yearInfo = iExtractYearInfo[fTitle, firstPageText];
+            docMeta = <|
+              "docId" -> fDocId, "title" -> fTitle,
+              "author" -> Lookup[fMetadata, "author", ""],
+              "sourcePath" -> fAbsPath,
+              "sourceType" -> If[iIsURL[fPdfPath], "url", "file"],
+              "privacy" -> fDocPrivacy, "collection" -> fCollection,
+              "pageCount" -> Lookup[fMetadata, "pageCount", 0],
+              "chunkCount" -> Length[processedChunks],
+              "yearInfo" -> yearInfo,
+              "indexedAt" -> DateString[Now, "ISODateTime"],
+              "storageType" -> If[fDocPrivacy > 0.5, "private", "public"]|>;
+            docFile = FileNameJoin[{indexDir, "doc_" <> fDocId <> ".wl"}];
+            Put[docMeta, docFile];
+            processedChunks = Append[#, "docId" -> fDocId] & /@ processedChunks;
+            chunkFile = FileNameJoin[{indexDir, "chunks_" <> fDocId <> ".wl"}];
+            Put[processedChunks, chunkFile];
+            (* TOC/カタログ保存 *)
+            Module[{toc = Lookup[$pdfIndexAsyncContext, "pendingTOC", {}], tf},
+              If[ListQ[toc] && Length[toc] > 0,
+                tf = FileNameJoin[{indexDir, "toc_" <> fDocId <> ".wl"}];
+                Put[toc, tf]];
+              $pdfIndexAsyncContext = KeyDrop[$pdfIndexAsyncContext, "pendingTOC"]];
+            Module[{cat = Lookup[$pdfIndexAsyncContext, "pendingCatalog", <||>], cf},
+              If[AssociationQ[cat] && Length[cat] > 0,
+                cf = FileNameJoin[{indexDir, "catalog_" <> fDocId <> ".wl"}];
+                Put[cat, cf]];
+              $pdfIndexAsyncContext = KeyDrop[$pdfIndexAsyncContext, "pendingCatalog"]];
+            $pdfIndexCache = KeyDrop[$pdfIndexCache, fCollection];
+            <|"docId" -> fDocId, "title" -> fTitle,
+              "privacy" -> fDocPrivacy,
+              "chunks" -> Length[processedChunks],
+              "collection" -> fCollection|>]]]];
+
+    (* ═══════════════════════════════════════════════════
+       LLMGraphDAGCreate でジョブ登録・スケジューラ起動
+       ═══════════════════════════════════════════════════ *)
+    With[{fGarbledPages = garbledPages},
+      jobId = ClaudeCode`LLMGraphDAGCreate[<|
+        "nodes" -> nodes,
+        "taskDescriptor" -> $iPdfTaskDescriptor,
+        "nb" -> nb,
+        "context" -> <|
+          "chunks" -> chunks,
+          "docId" -> docId,
+          "title" -> title,
+          "garbledPages" -> garbledPages
+        |>,
+        "onComplete" -> Function[{completedJob},
+          Module[{ns = completedJob["nodes"],
+                  finalResult = Lookup[
+                    Lookup[completedJob["nodes"], "finalize", <||>],
+                    "result", None],
+                  failCount, jnb = Lookup[completedJob, "nb", $Failed]},
+            failCount = Count[Values[ns],
+              _?(Lookup[#, "status", ""] === "failed" &)];
+            If[jnb =!= $Failed && AssociationQ[finalResult],
+              NotebookWrite[jnb, Cell[BoxData[ToBoxes[
+                If[failCount > 0,
+                  Append[finalResult, "failedNodes" -> failCount],
+                  finalResult]]], "Output"]]];
+            Scan[Module[{imgDir = FileNameJoin[{$TemporaryDirectory,
+                  "pdfocr_" <> jobId <> "_p" <> ToString[#]}]},
+              If[DirectoryQ[imgDir],
+                Quiet[DeleteDirectory[imgDir, DeleteContents -> True]]]] &,
+              fGarbledPages]]]
+      |>]];
+
+    jobId
+  ];
+
+
+
+
+(* === ページ分析 + チャンキング ヘルパー (同期版 pdfIndex 用、互換維持) === *)
+iRunPageAnalysisAndChunking[extractResult_Association, absPath_String,
+    metadata_Association] := Module[
+  {pages, pageResults = {}, visionPages = {}, textPages = {},
+   tocData, mergedTables, catalog, chunks, pg, rawText, isVision, visionResult},
+  tocData = Lookup[extractResult, "toc", {}];
+  Module[{toc = iExtractTOC[absPath]},
+    Print["  TOC\:30a8\:30f3\:30c8\:30ea: " <> ToString[Length[toc]] <> "\:4ef6"];
+    If[ListQ[toc] && Length[toc] > 0,
+      $pdfIndexAsyncContext["pendingTOC"] = toc;
+      tocData = toc]];
+  Print["  \:30da\:30fc\:30b8\:5206\:6790\:4e2d..."];
+  pages = Lookup[extractResult, "pages", {}];
+  Do[
+    pg = page["pageNum"]; rawText = Lookup[page, "text", ""];
+    isVision = iIsTableOrFigurePage[rawText];
+    If[isVision, AppendTo[visionPages, pg], AppendTo[textPages, pg]],
+    {page, pages}];
+  Print["  \:30d3\:30b8\:30e7\:30f3\:89e3\:6790\:5bfe\:8c61: " <>
+    ToString[Length[visionPages]] <> "\:30da\:30fc\:30b8 / " <>
+    ToString[Length[pages]] <> "\:30da\:30fc\:30b8\:4e2d"];
+  Do[Module[{vpg = visionPages[[i]]},
+    Print["  \:30d3\:30b8\:30e7\:30f3\:89e3\:6790: p." <> ToString[vpg] <>
+      " (" <> ToString[i] <> "/" <> ToString[Length[visionPages]] <> ")"];
+    visionResult = Quiet @ Check[iAnalyzePageWithVision[absPath, vpg], $Failed];
+    If[AssociationQ[visionResult],
+      AppendTo[pageResults,
+        Join[visionResult, <|"pageNum" -> vpg, "isVision" -> True|>]],
+      AppendTo[pageResults,
+        <|"pageNum" -> vpg, "isVision" -> False,
+          "rawText" -> Lookup[
+            SelectFirst[pages, #["pageNum"] === vpg &, <||>], "text", ""],
+          "paragraphs" -> {}, "tables" -> {}, "figures" -> {}|>]]],
+    {i, Length[visionPages]}];
+  Do[AppendTo[pageResults,
+    <|"pageNum" -> pg, "isVision" -> False,
+      "rawText" -> Lookup[
+        SelectFirst[pages, #["pageNum"] === pg &, <||>], "text", ""],
+      "paragraphs" -> {}, "tables" -> {}, "figures" -> {}|>],
+    {pg, textPages}];
+  pageResults = SortBy[pageResults, Lookup[#, "pageNum", 9999] &];
+  mergedTables = iMergeSpanningTables[pageResults];
+  catalog = iBuildCatalog[pageResults, mergedTables, tocData];
+  Print["  \:30ab\:30bf\:30ed\:30b0: \:8868" <> ToString[Length[catalog["tables"]]] <>
+    " \:56f3" <> ToString[Length[catalog["figures"]]] <>
+    " \:30bb\:30af\:30b7\:30e7\:30f3" <> ToString[Length[catalog["sections"]]]];
+  $pdfIndexAsyncContext["pendingCatalog"] = catalog;
+  chunks = iChunkFromStructured[pageResults, mergedTables];
+  Print["  \:69cb\:9020\:5316\:30c1\:30e3\:30f3\:30af: " <> ToString[Length[chunks]] <> "\:4ef6"];
+  Module[{ocrFixed = Lookup[$pdfIndexAsyncContext, "ocrFixedPages", <||>]},
+    If[AssociationQ[ocrFixed] && Length[ocrFixed] > 0,
+      Print["  OCR\:30c6\:30ad\:30b9\:30c8\:3067\:30c1\:30e3\:30f3\:30af\:7f6e\:63db: p." <>
+        StringRiffle[ToString /@ Keys[ocrFixed], ","]];
+      chunks = Map[Module[{cpg = Lookup[#, "pageNum", 0], fixedText},
+        fixedText = Lookup[ocrFixed, cpg, None];
+        If[StringQ[fixedText],
+          Append[KeyDrop[#, "text"], "text" -> fixedText], #]] &, chunks];
+      $pdfIndexAsyncContext = KeyDrop[$pdfIndexAsyncContext, "ocrFixedPages"]]];
+  chunks
+];
 
 (* ============================================================ *)
 (* URL ダウンロード・キャッシュ                                   *)
@@ -1931,6 +2965,37 @@ except Exception as e:
     Quiet[DeleteFile[outJsonFile]];
     If[!ListQ[json], Return[iSearchPDFPagesWL[pdfPath, terms]]];
 
+    (* === 文字化けページをインデックス済みチャンクテキストで補完 ===
+       CIDフォント等で PyMuPDF のテキスト抽出が失敗するページを検出し、
+       インデクシング時に OCR 済みのチャンクテキストで置換する。
+       これにより「離散数学」等のタームが文字化けページでもヒットする。 *)
+    Module[{garbledPages, chunks, chunkByPage},
+      garbledPages = Select[json,
+        iIsGarbledText[Lookup[#, "text", ""]] &];
+      If[Length[garbledPages] > 0,
+        Print["  \:6587\:5b57\:5316\:3051\:88dc\:5b8c: p." <>
+          StringRiffle[ToString[Lookup[#, "page", 0]] & /@
+            garbledPages, ","] <> " \:2192 \:30a4\:30f3\:30c7\:30c3\:30af\:30b9\:30c1\:30e3\:30f3\:30af\:4f7f\:7528"];
+        chunks = iLoadCollectionChunks[collection];
+        (* チャンクをページ番号でグループ化 *)
+        chunkByPage = <||>;
+        Do[Module[{pg = Lookup[c, "pageNum", 0], txt = Lookup[c, "text", ""]},
+          If[IntegerQ[pg] && pg > 0 && StringQ[txt],
+            If[KeyExistsQ[chunkByPage, pg],
+              chunkByPage[pg] = chunkByPage[pg] <> "\n" <> txt,
+              chunkByPage[pg] = txt]]],
+          {c, chunks}];
+        json = Map[
+          Module[{pg = Lookup[#, "page", 0], chunkText},
+            If[iIsGarbledText[Lookup[#, "text", ""]],
+              chunkText = Lookup[chunkByPage, pg, None];
+              If[StringQ[chunkText] && StringLength[chunkText] > 20 &&
+                 !iIsGarbledText[chunkText],
+                <|"page" -> pg, "text" -> StringTake[chunkText, UpTo[5000]]|>,
+                #],
+              #]] &,
+          json]]];
+
     (* スコアリング: 個別ページ *)
     allPages = iScorePagesByProximity[json, terms];
 
@@ -1981,6 +3046,44 @@ except Exception as e:
                 {pg, sc + 30.0},
               True, #]] &,
           allPages]]];
+
+    (* === データテーブルページブースト ===
+       「配当期は？」「単位数は？」など具体的データを問うクエリでは、
+       カリキュラムマップ(概念図)より実際のデータ表を優先する。
+       データ表の特定指標:
+         - 科目コード (T06xxx, T16xxx等) が多数 → 配当表/科目一覧
+         - "講義"/"演習" が複数回 → 授業形態記載の表
+       概念図(カリキュラムマップ)は短い行が多いが科目コードは含まない *)
+    Module[{dataTerms = {"配当", "単位", "開講", "必修", "選択", "前期", "後期",
+              "科目", "ナンバー", "時間割"}, isDataQuery},
+      isDataQuery = AnyTrue[dataTerms,
+        StringContainsQ[query, #] &];
+      If[isDataQuery,
+        allPages = Map[
+          Module[{pg = #[[1]], sc = #[[2]], pageText, codeCount, formatCount,
+                  tableScore = 0},
+            pageText = Lookup[
+              SelectFirst[json, Lookup[#, "page", 0] === pg &, <||>],
+              "text", ""];
+            If[StringLength[pageText] > 0,
+              (* 科目コード数: データ表の指標 (控えめなブースト:
+                 タームの関連性を上書きしないよう抑制) *)
+              codeCount = Length[StringCases[pageText,
+                RegularExpression["[A-Z]\\d{2}[A-Z]{2,3}\\d{3}"]]];
+              (* 授業形態: "講義" "演習" "実験" の出現数 *)
+              formatCount = StringCount[pageText, "講義"] +
+                StringCount[pageText, "演習"] +
+                StringCount[pageText, "実験"];
+              tableScore = Min[sc * 0.2, codeCount * 3 + formatCount * 2];
+              If[tableScore > 0,
+                Print["  p." <> ToString[pg] <> " \:30c6\:30fc\:30d6\:30eb\:30b9\:30b3\:30a2: +" <>
+                  ToString[tableScore] <>
+                  " (\:79d1\:76ee\:30b3\:30fc\:30c9" <> ToString[codeCount] <>
+                  ", \:6388\:696d\:5f62\:614b" <> ToString[formatCount] <> ")"]];
+              {pg, sc + tableScore},
+            #]] &,
+          allPages];
+        Print["  \:30c7\:30fc\:30bf\:30af\:30a8\:30ea\:691c\:51fa: \:30c6\:30fc\:30d6\:30eb\:30d6\:30fc\:30b9\:30c8\:9069\:7528"]]];
 
     bestPage = First[SortBy[allPages, -#[[2]] &]];
     Print["  \:30da\:30fc\:30b8\:30b9\:30b3\:30a2: " <>
@@ -2063,15 +3166,58 @@ iSearchPDFPagesWL[pdfPath_String, terms_List] :=
         $Failed]]
   ];
 
+(* クエリから年度表現を除去 (ページスコアリング用)
+   年度はドキュメント選択に使用済みのため、ページ検索では不要。
+   残すとPDF内テキストとマッチせずノイズになる。 *)
+iStripYearFromQuery[query_String] := Module[{q},
+  q = iNormalizeDigits[query];
+  q = StringReplace[q, {
+    RegularExpression["(令和|平成|昭和)\\d{1,2}年度?入学生?[のに]?"] -> "",
+    RegularExpression["(?<![A-Za-z])(R|H|S)\\d{1,2}年度?[のに]?"] -> "",
+    RegularExpression["20\\d{2}年度?[のに]?"] -> ""}];
+  StringTrim[q]
+];
+
 (* クエリにマッチするページ番号を検索 *)
 PDFIndex`pdfFindPage[query_String, collection_String:"default"] :=
-  Module[{pdfPath, pageNum},
-    pdfPath = iGetDocSourcePath[collection];
-    If[pdfPath === None || !FileExistsQ[pdfPath],
-      Print["\[WarningSign] PDF\:30d5\:30a1\:30a4\:30eb\:304c\:898b\:3064\:304b\:308a\:307e\:305b\:3093"];
+  Module[{pdfPath, pageNum, queryYear, docResult, bestDoc, yearNote,
+          searchQuery},
+    (* === 年度対応: コレクション内の複数ドキュメントから年度で選択 ===
+       年度なしの場合は最新版を優先する *)
+    queryYear = iExtractYearFromQuery[query];
+    docResult = iFindBestDocByYear[collection, queryYear];
+    If[!AssociationQ[docResult],
+      Print["\[WarningSign] \:30c9\:30ad\:30e5\:30e1\:30f3\:30c8\:304c\:898b\:3064\:304b\:308a\:307e\:305b\:3093"];
       Return[$Failed]];
-    Print["  PDF\:30da\:30fc\:30b8\:3092\:691c\:7d22\:4e2d..."];
-    pageNum = iSearchPDFPagesWithCollection[pdfPath, query, collection];
+    bestDoc = docResult["doc"];
+    yearNote = docResult["yearNote"];
+    pdfPath = Lookup[bestDoc, "sourcePath", None];
+    (* 年度表現を除去したクエリ (ページスコアリング用) *)
+    searchQuery = iStripYearFromQuery[query];
+    If[StringLength[searchQuery] < 2, searchQuery = query];
+    (* ログ出力 *)
+    Module[{yi = Lookup[bestDoc, "yearInfo", None]},
+      If[AssociationQ[yi],
+        If[docResult["yearMatch"] === "exact",
+          Print["  \:5e74\:5ea6\:4e00\:81f4: " <> yi["japaneseYear"] <>
+            "\:5e74\:5ea6 (" <> ToString[yi["westernYear"]] <> ")"],
+          If[docResult["yearMatch"] === "approximate",
+            Print["  \:5e74\:5ea6\:8fd1\:4f3c: " <> iWesternToJapaneseEra[queryYear] <>
+              "\:5e74\:5ea6\:8981\:6c42 \:2192 " <> yi["japaneseYear"] <>
+              "\:5e74\:5ea6 (" <> ToString[yi["westernYear"]] <> ")\:3092\:4f7f\:7528"],
+            Print["  \:6700\:65b0\:7248: " <> yi["japaneseYear"] <>
+              "\:5e74\:5ea6 (" <> ToString[yi["westernYear"]] <> ")"]]]]];
+    (* 非同期コンテキストに記録 *)
+    $pdfIndexAsyncContext["yearNote"] = yearNote;
+    $pdfIndexAsyncContext["resolvedCollection"] = collection;
+    $pdfIndexAsyncContext["resolvedDocPath"] = pdfPath;
+    If[pdfPath === None || !FileExistsQ[pdfPath],
+      Print["\[WarningSign] PDF\:30d5\:30a1\:30a4\:30eb\:304c\:898b\:3064\:304b\:308a\:307e\:305b\:3093: " <>
+        ToString[pdfPath]];
+      Return[$Failed]];
+    Print["  PDF\:30da\:30fc\:30b8\:3092\:691c\:7d22\:4e2d... (" <>
+      FileNameTake[pdfPath] <> ")"];
+    pageNum = iSearchPDFPagesWithCollection[pdfPath, searchQuery, collection];
     If[IntegerQ[pageNum],
       Print["  \:2192 \:30da\:30fc\:30b8 " <> ToString[pageNum] <> " \:306b\:30de\:30c3\:30c1"];
       pageNum,
@@ -2742,6 +3888,12 @@ iStartPDFJobProcessor[] := Module[{},
               If[!IntegerQ[pageNum],
                 pageNum = Quiet @ Check[
                   PDFIndex`pdfFindPage[query, collection], None]];
+              (* pdfFindPage が年度に基づいてコレクションを切替えた場合、
+                 resolvedCollection を使用する *)
+              Module[{resolvedC = Lookup[$pdfIndexAsyncContext,
+                  "resolvedCollection", collection],
+                yearNote = Lookup[$pdfIndexAsyncContext, "yearNote", None],
+                docPath = Lookup[$pdfIndexAsyncContext, "resolvedDocPath", None]},
               If[IntegerQ[pageNum],
                 pairPages = Lookup[$pdfIndexAsyncContext, "lastPairPages", None];
                 (* ステージ2をキューに追加: 次のティックで実行 *)
@@ -2750,13 +3902,15 @@ iStartPDFJobProcessor[] := Module[{},
                     "pageNum" -> pageNum,
                     "pairPages" -> pairPages,
                     "query" -> query,
-                    "collection" -> collection,
+                    "collection" -> resolvedC,
+                    "docPath" -> docPath,
+                    "yearNote" -> yearNote,
                     "t0" -> jobInfo["t0"]|>,
                 (* 検索失敗 *)
                 $PDFJobResults[jobId] =
                   <|"result" -> <|"error" -> "\:30da\:30fc\:30b8\:304c\:898b\:3064\:304b\:308a\:307e\:305b\:3093\:3067\:3057\:305f"|>,
                     "elapsed" -> Round[AbsoluteTime[] - jobInfo["t0"], 0.01],
-                    "type" -> "pdfpage", "query" -> query|>]],
+                    "type" -> "pdfpage", "query" -> query|>]]],
 
           (* === ステージ2: レンダリングのみ (ExternalEvaluate 1回) ===
              Web版は1ページのみレンダリング (HTMLサイズ制限のため)。
@@ -2766,7 +3920,10 @@ iStartPDFJobProcessor[] := Module[{},
               query = Lookup[jobInfo, "query", ""];
               collection = Lookup[jobInfo, "collection", "default"];
               pageNum = jobInfo["pageNum"];
-              pdfPath = iGetDocSourcePath[collection];
+              (* 年度選択で解決済みのドキュメントパスを使用 *)
+              pdfPath = Lookup[jobInfo, "docPath", None];
+              If[!StringQ[pdfPath] || !FileExistsQ[pdfPath],
+                pdfPath = iGetDocSourcePath[collection]];
               result = Quiet @ Check[
                 If[StringQ[pdfPath] && FileExistsQ[pdfPath],
                   b64Map = iRenderPagesBase64[pdfPath, {pageNum}];
@@ -2779,7 +3936,8 @@ iStartPDFJobProcessor[] := Module[{},
               elapsed = Round[AbsoluteTime[] - jobInfo["t0"], 0.01];
               $PDFJobResults[jobId] =
                 <|"result" -> result, "elapsed" -> elapsed,
-                  "type" -> "pdfpage", "query" -> query|>],
+                  "type" -> "pdfpage", "query" -> query,
+                  "yearNote" -> Lookup[jobInfo, "yearNote", None]|>],
 
           (* === pdfask: SessionSubmit で実行 === *)
           jobType === "pdfask",
@@ -3042,13 +4200,17 @@ iPDFJobPoll[jobId_String, returnPath_String] :=
       query = Lookup[jr, "query", ""];
       html = Switch[jobType,
         "pdfask",  iPDFRenderAskResult[query, result, elapsed, returnPath],
-        "pdfpage", iPDFRenderPageResult[query, result, elapsed, returnPath],
+        "pdfpage", iPDFRenderPageResult[query, result, elapsed, returnPath,
+                     Lookup[jr, "yearNote", None]],
         _, "<h1>Error</h1><p>Unknown job type</p>"];
-      (* pdfpage は完全なHTMLを返す。Content-Length なし + Connection: close で
-         大きな画像データでもブラウザが全データを受信するまで待つ *)
+      (* pdfpage は完全なHTMLを返す。Content-Length 必須:
+         base64画像で数十KBになるため、Content-Length がないと
+         Pause[0.05]+Close でブラウザが全データ受信前に切断される *)
       If[jobType === "pdfpage",
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n" <>
-        "Connection: close\r\n\r\n" <> html,
+        Module[{bodyBytes = StringToByteArray[html, "UTF-8"]},
+          "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n" <>
+          "Content-Length: " <> ToString[Length[bodyBytes]] <> "\r\n" <>
+          "Connection: close\r\n\r\n" <> html],
         iHTTP200[iPDFHTMLPage["PDF - \:7d50\:679c", html]]]],
     (* まだ処理中 → 再ポーリング *)
     If[KeyExistsQ[$PDFJobPending, jobId] || TrueQ[$PDFJobProcessing],
@@ -3098,14 +4260,21 @@ iPDFRenderAskResult[query_String, result_, elapsed_, returnPath_String] :=
    超軽量HTML: CSS外部ファイルなし、直接インラインbase64。
    36 DPI で ~30KB base64、HTML全体 ~35KB。
    WebServer 512B×0.05s = ~3.4秒で送信完了。 *)
-iPDFRenderPageResult[query_String, result_, elapsed_, returnPath_String] :=
-  Module[{pageNum, b64Main, navHtml = "", imgHtml = ""},
+iPDFRenderPageResult[query_String, result_, elapsed_, returnPath_String,
+    yearNote_:None] :=
+  Module[{pageNum, b64Main, navHtml = "", imgHtml = "", yearHtml = ""},
     If[!AssociationQ[result],
       Return["<html><body><h1>Error</h1><p>" <> ToString[result] <>
         "</p><a href='/pdfpage'>Back</a></body></html>"]];
     If[KeyExistsQ[result, "error"],
       Return["<html><body><h1>Error</h1><p>" <> result["error"] <>
         "</p><a href='/pdfpage'>Back</a></body></html>"]];
+    (* 年度ミスマッチ警告 *)
+    If[StringQ[yearNote],
+      yearHtml = "<div style='background:#442200;border:1px solid #886600;" <>
+        "padding:8px 12px;border-radius:6px;margin:8px 0;" <>
+        "color:#ffcc44;font-size:13px'>" <>
+        WebServer`Private`iHTMLEscape[yearNote] <> "</div>\n"];
 
     pageNum = Lookup[result, "pageNum", 0];
     b64Main = Lookup[result, "b64Main", None];
@@ -3145,6 +4314,7 @@ iPDFRenderPageResult[query_String, result_, elapsed_, returnPath_String] :=
     WebServer`Private`iHTMLEscape[query] <>
     " \:2192 p." <> ToString[pageNum] <>
     " (" <> ToString[elapsed] <> "s)</p>\n" <>
+    yearHtml <>
     navHtml <>
     "<h3 style='color:#4488cc'>PDF p." <> ToString[pageNum] <> "</h3>\n" <>
     imgHtml <>
