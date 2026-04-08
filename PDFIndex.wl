@@ -191,6 +191,38 @@ iIsURL[s_String] := StringMatchQ[s, ("http://" | "https://") ~~ __];
 iIsURL[_] := False;
 
 (* ============================================================ *)
+(* パス相対化・解決ヘルパー                                      *)
+(* $packageDirectory 変更時にも正しく動作するよう、               *)
+(* 保存時は相対パス、読み出し時に展開する。                       *)
+(* ============================================================ *)
+
+(* iMakeRelativePath: $packageDirectory 配下なら相対パスに変換 *)
+iMakeRelativePath[absPath_String] := Module[{baseDir, normalized, normalizedBase},
+  If[iIsURL[absPath], Return[absPath]];
+  baseDir = Global`$packageDirectory;
+  If[!StringQ[baseDir], Return[absPath]];
+  (* パス区切り文字を統一して比較 *)
+  normalized = StringReplace[absPath, "\\" -> "/"];
+  normalizedBase = StringReplace[baseDir, "\\" -> "/"];
+  If[!StringEndsQ[normalizedBase, "/"],
+    normalizedBase = normalizedBase <> "/"];
+  If[StringStartsQ[normalized, normalizedBase],
+    StringDrop[normalized, StringLength[normalizedBase]],
+    absPath]
+];
+
+(* iResolveSourcePath: 保存済みパスを絶対パスに解決 *)
+iResolveSourcePath[storedPath_String] := Module[{},
+  If[iIsURL[storedPath], Return[storedPath]];
+  (* 既に絶対パスなら (ドライブレター or / 始まり) そのまま *)
+  If[StringMatchQ[storedPath, LetterCharacter ~~ ":" ~~ __] ||
+     StringStartsQ[storedPath, "/"],
+    Return[storedPath]];
+  (* 相対パス → $packageDirectory で展開 *)
+  FileNameJoin[{Global`$packageDirectory, storedPath}]
+];
+
+(* ============================================================ *)
 (* PDF テキスト抽出 (Python/PyMuPDF)                             *)
 (* ============================================================ *)
 
@@ -1799,7 +1831,7 @@ PDFIndex`pdfIndex[pdfPath_String, opts:OptionsPattern[]] :=
         "docId" -> docId,
         "title" -> title,
         "author" -> Lookup[metadata, "author", ""],
-        "sourcePath" -> If[iIsURL[pdfPath], pdfPath, absPath],
+        "sourcePath" -> If[iIsURL[pdfPath], pdfPath, iMakeRelativePath[absPath]],
         "sourceType" -> If[iIsURL[pdfPath], "url", "file"],
         "privacy" -> docPrivacy,
         "collection" -> collection,
@@ -2227,7 +2259,7 @@ PDFIndex`pdfIndexAsync[pdfPath_String, opts:OptionsPattern[]] :=
             docMeta = <|
               "docId" -> fDocId, "title" -> fTitle,
               "author" -> Lookup[fMetadata, "author", ""],
-              "sourcePath" -> fAbsPath,
+              "sourcePath" -> If[iIsURL[fPdfPath], fPdfPath, iMakeRelativePath[fAbsPath]],
               "sourceType" -> If[iIsURL[fPdfPath], "url", "file"],
               "privacy" -> fDocPrivacy, "collection" -> fCollection,
               "pageCount" -> Lookup[fMetadata, "pageCount", 0],
@@ -2887,7 +2919,7 @@ PDFIndex`pdfGetChunk[{from_Integer, to_Integer}, collection_String:"default"] :=
 iGetDocSourcePath[collection_String] := Module[{docs},
   docs = iLoadCollectionDocs[collection];
   If[Length[docs] > 0,
-    First[docs]["sourcePath"],
+    iResolveSourcePath[First[docs]["sourcePath"]],
     None]
 ];
 
@@ -3191,7 +3223,7 @@ PDFIndex`pdfFindPage[query_String, collection_String:"default"] :=
       Return[$Failed]];
     bestDoc = docResult["doc"];
     yearNote = docResult["yearNote"];
-    pdfPath = Lookup[bestDoc, "sourcePath", None];
+    pdfPath = iResolveSourcePath[Lookup[bestDoc, "sourcePath", ""]];
     (* 年度表現を除去したクエリ (ページスコアリング用) *)
     searchQuery = iStripYearFromQuery[query];
     If[StringLength[searchQuery] < 2, searchQuery = query];
@@ -3687,7 +3719,7 @@ PDFIndex`pdfReindex[collection_String:"default"] :=
     Print["[pdfReindex] " <> ToString[Length[docs]] <> " \:30c9\:30ad\:30e5\:30e1\:30f3\:30c8\:3092\:518d\:30a4\:30f3\:30c7\:30c3\:30af\:30b9\:3057\:307e\:3059"];
     docIds = Table[
       Module[{doc = docs[[i]], path},
-        path = doc["sourcePath"];
+        path = iResolveSourcePath[doc["sourcePath"]];
         Print["\n--- " <> ToString[i] <> "/" <> ToString[Length[docs]] <>
           ": " <> doc["title"] <> " ---"];
         Quiet @ Check[
