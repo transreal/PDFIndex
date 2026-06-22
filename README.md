@@ -14,17 +14,25 @@ PDFIndex は、PDF ファイルのテキストを抽出・チャンク化し、E
 
 テキスト抽出は信頼性を最優先した多段フォールバック構成です。**PyMuPDF (fitz)** が最優先で使用され、インストールされていない場合は **pdfplumber** にフォールバックし、最終的には Mathematica ネイティブの `Import` が使われます。
 
-文字化け検出も実装されており、CIDフォント等に起因するページは「ひらがな連続のパターン頻度」をヒューリスティクスとして検出されます。文字化けが検出されたページは OCR パイプライン（**Claude Vision → EasyOCR → TextRecognize** の順）で自動修復されます。
+文字化け検出も実装されており、CIDフォント等に起因するページは「ひらがな連続のパターン頻度」をヒューリスティクスとして検出されます。文字化けが検出されたページは OCR パイプライン（**EasyOCR（並列）→ Claude Vision CLI（失敗ページのみ逐次フォールバック）→ TextRecognize** の順）で自動修復されます。EasyOCR ステップは `$pdfParallelKernelCount` のサブカーネルで並列実行され、大量のスキャンページでも効率的に処理されます。
 
 ### 構造化チャンキングと表の保全
 
 単純な文字数ベースのチャンキングに加え、PyMuPDF の `find_tables()` を使った**構造化チャンキング**に対応しています。表は複数ページにまたがる場合もマージされ、1つの表が1チャンクとして Markdown 表形式で格納されます。これにより、単位数表・配当表などの表形式データをそのまま検索・LLM 参照できます。
 
-目次（TOC）抽出も実装されており、クエリにマッチするセクションのページ範囲を特定することで、関連チャンクの絞り込み精度を高めます。
+目次（TOC）抽出も実装されており、クエリにマッチするセクションのページ範囲を特定することで、関連チャンクの絞り込み精度を高めます。論理ページラベル（印刷ページ番号）と物理ページ番号の対応も自動検出・変換されるため、表紙・前付きのある PDF でも印刷上のページ番号をそのまま指定できます。
+
+### エンティティインデックスによるクエリ正規化
+
+インデクシング時に、学科名・人名・建物名などの固有名詞一覧を**エンティティインデックス**として自動生成します。固有名詞はページ本文だけでなくドキュメントタイトルからも抽出されます。検索時はこのエンティティインデックスと検索辞書（エイリアス・ターム展開）を組み合わせてクエリタームを自動正規化するため、略称や表記ゆれがあっても高精度な検索が可能です。
+
+### スコアリングアルゴリズム
+
+`pdfSearch` はチャンク単位の Embedding 近傍検索を起点としたページスコアリングを行い、複数ターム共起ボーナス・見出し一致ボーナス・目次一致ボーナス・目次ページペナルティ・学科名ペナルティを組み合わせて関連性の高いページを上位に返します。複数のタームが同一チャンクや目次エントリで揃って一致するほどスコアが乗算的に増幅されるため、具体的な複合クエリほど精度が向上します。
 
 ### LLM・Embedding の非課金設計
 
-LLM 呼び出しはすべて [claudecode](https://github.com/transreal/claudecode) の `ClaudeQueryBg` / `ClaudeQuery` 経由で行われ、**Claude Code CLI を使用するため課金 API は呼ばれません**。Embedding は **LM Studio のローカルサーバー**（`text-embedding-multilingual-e5-large-instruct`）を OpenAI 互換 API で直接呼び出します。LM Studio が起動していない場合は [maildb](https://github.com/transreal/maildb) のフォールバックを試み、それも利用不可の場合はキーワード検索のみで動作します。
+LLM 呼び出しはすべて [claudecode](https://github.com/transreal/claudecode) の `ClaudeQueryBg` / `ClaudeQuery` 経由で行われ、**Claude Code CLI を使用するため課金 API は呼ばれません**。Embedding は **LM Studio のローカルサーバー**（`text-embedding-baai-bge-m3-568m`）を OpenAI 互換 API で直接呼び出します。bge-m3 は最大 8192 トークンに対応した多言語モデルで、複数ページにわたる表や長文チャンクも途切れずに Embedding できます。LM Studio が起動していない場合はキーワード検索のみで動作します。
 
 ### 非同期インデクシングとノートブック統合
 
@@ -50,7 +58,7 @@ LLM 呼び出しはすべて [claudecode](https://github.com/transreal/claudecod
 | パッケージ | 必須 | リンク |
 |-----------|------|--------|
 | localInit | **必須** | [github.com/transreal/localInit](https://github.com/transreal/localInit) |
-| claudecode | 推奨（LLM 検索に使用） | [github.com/transreal/claudecode](https://github.com/transreal/claudecode) |
+| claudecode | 推奨（LLM 検索・Claude Vision OCR に使用） | [github.com/transreal/claudecode](https://github.com/transreal/claudecode) |
 | maildb | 任意（Embedding フォールバック） | [github.com/transreal/maildb](https://github.com/transreal/maildb) |
 
 各 `.wl` ファイルを `$packageDirectory` に配置してください。
@@ -79,10 +87,14 @@ pip install pdfplumber
 #### LM Studio のセットアップ（ローカル Embedding）
 
 1. [LM Studio](https://lmstudio.ai/) をインストールして起動します。
-2. モデル `text-embedding-multilingual-e5-large-instruct` をダウンロードします。
+2. モデル `text-embedding-baai-bge-m3-568m` をダウンロードします。
 3. **Local Server** タブで **Start Server** を実行します（デフォルトポート: `1234`）。
 
+> bge-m3 は最大 8192 トークンに対応しており、以前使用していた `e5-large-instruct`（512 トークン上限）と比べて表・配当表を含む長文チャンクの検索精度が向上しています。
+
 > LM Studio が起動していない場合、Embedding は使用されず**キーワード検索のみ**で動作します。
+
+詳細なセットアップ手順（OCR フォールバックの優先順位・検索辞書の設定など）は [setup.md](setup.md) を参照してください。
 
 #### $Path の設定とパッケージの読み込み
 
@@ -109,16 +121,18 @@ Block[{$CharacterEncoding = "UTF-8"},
   Needs["PDFIndex`", "PDFIndex.wl"]]
 
 (* 2. 主要な設定変数（デフォルト値） *)
-(* $pdfIndexBaseDir  ... 秘密 PDF インデックスの保存先
-                         デフォルト: $packageDirectory\pdfindex_private *)
-(* $pdfIndexAttachDir ... 公開 PDF インデックスの保存先
-                         デフォルト: $packageDirectory\claude_attachments *)
-(* $pdfIndexDebug    ... デバッグ出力の有効化（デフォルト: False） *)
+(* $pdfIndexBaseDir        ... 秘密 PDF インデックスの保存先
+                               デフォルト: $packageDirectory\pdfindex_private *)
+(* $pdfIndexAttachDir      ... 公開 PDF インデックスの保存先
+                               デフォルト: $packageDirectory\claude_attachments *)
+(* $pdfIndexDebug          ... デバッグ出力の有効化（デフォルト: False） *)
+(* $pdfParallelKernelCount ... OCR 並列サブカーネル数（デフォルト: Automatic） *)
+(* $PDFIndexDefaultDepartment ... クエリ補完用デフォルト学科名（デフォルト: None） *)
 
 (* 3. 動作確認 *)
 pdfPreflightCheck[]
 
-(* 4. PDF をインデックスに追加する（プライバシー自動推定） *)
+(* 4. PDF をインデックスに追加する（プライバシー自動推定・エンティティインデックス自動生成） *)
 pdfIndex["C:\\research\\paper.pdf",
   Collection -> "research",
   Keywords -> {"reversible computing", "QCA"}]
@@ -130,11 +144,13 @@ pdfSearch["可逆計算 ゲート構成", 5, Collection -> "research"]
 pdfAskLLM["reversible computing のゲート構成は?", Collection -> "research"]
 ```
 
-保存先をカスタマイズする場合はパッケージ読み込み後に設定します。
+保存先やその他の変数をカスタマイズする場合はパッケージ読み込み後に設定します。
 
 ```mathematica
-PDFIndex`$pdfIndexBaseDir  = "D:\\MyPDFIndex\\private"
-PDFIndex`$pdfIndexAttachDir = "D:\\MyPDFIndex\\public"
+PDFIndex`$pdfIndexBaseDir             = "D:\\MyPDFIndex\\private"
+PDFIndex`$pdfIndexAttachDir           = "D:\\MyPDFIndex\\public"
+PDFIndex`$pdfParallelKernelCount      = 4
+PDFIndex`$PDFIndexDefaultDepartment   = "情報工学科"
 ```
 
 ### 主な機能
@@ -143,11 +159,12 @@ PDFIndex`$pdfIndexAttachDir = "D:\\MyPDFIndex\\public"
 
 | 関数 | 説明 |
 |------|------|
-| `pdfIndex[pdfPath, opts]` | 単一 PDF をインデックスに追加する。Privacy 値に応じて保存先が自動選択される。 |
+| `pdfIndex[pdfPath, opts]` | 単一 PDF をインデックスに追加する。Privacy 値に応じて保存先が自動選択される。エンティティインデックス（固有名詞一覧）も自動生成される。 |
 | `pdfIndexDirectory[dirPath, opts]` | ディレクトリ内の全 PDF を一括インデックスする。`FilePattern` で対象ファイルを絞り込み可能。 |
 | `pdfIndexURL[url, opts]` | URL から PDF をダウンロードしてインデックスに追加する。 |
 | `pdfIndexAsync[pdfPath, opts]` | `pdfIndex` を非同期実行し、進捗をステータスバーに表示する。ノートブックの応答性を維持する。 |
-| `pdfReindex[collection]` | コレクション内の全ドキュメントの LLM 要約・Embedding を再生成する。 |
+| `pdfReindex[collection]` | コレクション内の全ドキュメントの LLM 要約・Embedding・エンティティインデックスを再生成する（フル再処理）。 |
+| `pdfReembed[collection]` | 保存済みチャンクテキストから Embedding のみを再生成・更新する。PDF 再抽出・LLM 再要約を行わない軽量版。エンコード修正後の既存 Embedding 再作成に使う。 |
 
 主なオプション:
 
@@ -155,7 +172,7 @@ PDFIndex`$pdfIndexAttachDir = "D:\\MyPDFIndex\\public"
 |-----------|-----------|------|
 | `Privacy` | `Automatic` | 0.0〜1.0。`Automatic` で LLM が自動推定する。 |
 | `Keywords` | `{}` | 追加キーワードのリスト。 |
-| `Title` | `""` | タイトルの上書き（省略時はファイル名）。 |
+| `Title` | `Automatic` | タイトルの上書き（省略時は PDF メタデータから取得）。 |
 | `Collection` | `"default"` | コレクション名。 |
 | `ForceReindex` | `False` | 既存エントリを強制的に上書きする。 |
 
@@ -163,7 +180,7 @@ PDFIndex`$pdfIndexAttachDir = "D:\\MyPDFIndex\\public"
 
 | 関数 | 説明 |
 |------|------|
-| `pdfSearch[query, n, opts]` | Embedding + キーワードのハイブリッド検索で上位 n 件のチャンクを返す。 |
+| `pdfSearch[query, n, opts]` | Embedding + キーワードのハイブリッド検索で上位 n 件のチャンクを返す。検索辞書とエンティティインデックスによるクエリ正規化が自動適用される。 |
 | `pdfSearchForLLM[query, opts]` | 検索結果を LLM プロンプト用テキストに変換する。公開・非公開を分離して返す。 |
 | `pdfAskLLM[question, opts]` | PDF インデックスを検索し、公開分はクラウド LLM、非公開分はローカル LLM に問い合わせる。 |
 | `pdfSearchUI[query, n, opts]` | インタラクティブな検索 UI をノートブックに表示する。`[全文]` `[前後]` `[質問]` ボタン付き。 |
@@ -176,20 +193,22 @@ PDFIndex`$pdfIndexAttachDir = "D:\\MyPDFIndex\\public"
 | `pdfListCollections[]` | 利用可能なコレクションの一覧を返す。 |
 | `pdfListDocs[collection]` | コレクション内のドキュメント一覧を `Dataset` で返す。 |
 | `pdfRemoveDoc[docId, collection]` | ドキュメントをインデックスから削除する。 |
-| `pdfShowPage[pageNum, collection]` | PDF の指定ページを画像としてノートブックに表示する。 |
+| `pdfShowPage[pageNum, collection]` | PDF の指定ページを画像としてノートブックに表示する。論理ページ番号は物理ページへ自動変換される。 |
 | `pdfGetChunk[chunkIndex, collection]` | 指定インデックスのチャンク全文を返す。範囲指定も可能。 |
 | `pdfFindPage[query, collection]` | クエリにマッチする PDF のページ番号を推定して返す。 |
 | `pdfStatus[]` | 現在のインデクシング状態を表示する。 |
 | `pdfPreflightCheck[]` | PDF 抽出・LLM・Embedding の動作確認を行い、各項目の状態を表示する。 |
 
+各関数のシグネチャ・オプション・戻り値の詳細は [user_manual.md](user_manual.md) と [api.md](api.md) を参照してください。
+
 ### ドキュメント一覧
 
 | ファイル | 内容 |
 |---------|------|
-| `api.md` | API リファレンス（関数シグネチャ・オプション・戻り値の詳細） |
-| `example.md` | 使用例集（単一 PDF・ディレクトリ・URL・検索・UI・LLM 質問など 10 例） |
-| `setup.md` | セットアップ手順（Python ライブラリ・LM Studio・インストール・動作確認） |
-| `user_manual.md` | ユーザーマニュアル（設定変数・各関数の詳細説明） |
+| [api.md](api.md) | API リファレンス（関数シグネチャ・オプション・戻り値の詳細） |
+| [examples/example.md](examples/example.md) | 使用例集（単一 PDF・ディレクトリ・URL・検索・UI・LLM 質問・検索辞書・デフォルト学科・並列カーネル・エンティティインデックスなど 14 例） |
+| [setup.md](setup.md) | セットアップ手順（Python ライブラリ・LM Studio・インストール・OCR フォールバック・検索辞書・動作確認） |
+| [user_manual.md](user_manual.md) | ユーザーマニュアル（設定変数・各関数の詳細説明・スコアリングアルゴリズム） |
 
 ---
 
@@ -255,6 +274,81 @@ result = pdfSearchForLLM["reversible computing gate",
   Collection -> "research"];
 result["public"]["prompt"]   (* クラウド LLM へ渡す文字列 *)
 result["private"]["prompt"]  (* ローカル LLM へ渡す文字列 *)
+```
+
+### 例 7: 指定ページを画像として表示する
+
+```mathematica
+(* 印刷上のページ番号を指定 → 物理ページ番号への変換は自動 *)
+pdfShowPage[124, "syllabus"]
+(* → ノートブックのセル出力に該当ページの画像がインラインで表示される *)
+```
+
+### 例 8: 検索辞書を設定してエイリアス・ターム展開を利用する
+
+`$packageDirectory` に `pdfindex_search_config.json` を配置すると、略称を正規名に変換したり複合語をサブワードに展開して検索精度を向上させたりできます。
+
+```json
+{
+  "aliases": {
+    "機械工学科": "機械システム工学科",
+    "情工": "情報工学科"
+  },
+  "term_expansions": {
+    "必修科目": ["必修", "科目"],
+    "配当表": ["配当", "科目表"]
+  }
+}
+```
+
+```mathematica
+(* 略称でも正規名と同等の検索結果が得られる *)
+pdfSearch["機械工学科 必修", 5, Collection -> "syllabus"]
+(* → "機械工学科" が自動的に "機械システム工学科" に解決されたうえで検索される *)
+```
+
+### 例 9: デフォルト学科を設定してクエリを絞り込む
+
+```mathematica
+(* 情報工学科専用コレクションとして使う場合 *)
+PDFIndex`$PDFIndexDefaultDepartment = "情報工学科";
+
+(* 学科名を省略しても情報工学科のページが優先される *)
+pdfSearch["必修単位数", 5, Collection -> "syllabus"]
+
+(* 補完をオフに戻す *)
+PDFIndex`$PDFIndexDefaultDepartment = None;
+```
+
+### 例 10: 並列カーネル数を設定して OCR を高速化する
+
+```mathematica
+(* 並列カーネル数を 4 に固定 *)
+PDFIndex`$pdfParallelKernelCount = 4;
+
+(* 文字化けページが多い PDF をインデックス *)
+pdfIndex["C:/Users/user/Documents/old_catalog.pdf",
+  Collection -> "archive",
+  ForceReindex -> True
+]
+(* → 4 つのサブカーネルで EasyOCR が並列実行され、処理速度が向上する。
+     EasyOCR で失敗したページのみ Claude Vision CLI → TextRecognize の順でフォールバックされる *)
+```
+
+### 例 11: エンティティインデックスを再構築する
+
+```mathematica
+(* 既存コレクションのエンティティインデックスを再構築 *)
+pdfReindex["syllabus"]
+(* → LLM 要約・Embedding・固有名詞インデックスがすべて再生成される *)
+```
+
+### 例 12: Embedding のみを軽量再生成する
+
+```mathematica
+(* PDF 再抽出・LLM 再要約を行わずに Embedding だけを更新する *)
+pdfReembed["research"]
+(* → エンコード修正後や Embedding モデル変更後に使用する *)
 ```
 
 ---
